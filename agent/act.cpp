@@ -14,6 +14,7 @@
 #include "brain/belief_state.h"
 #include "brain/eval.h"
 #include "brain/mcts.h"
+#include "brain/net.h"
 #include "brain/search.h"
 #include "sim/belief.h"
 #include "sim/rules.h"
@@ -49,7 +50,10 @@ const bool g_debug = env_flag("ST_DEBUG");
 
 // 策略切换：默认走 phase① 的本回合搜索；ST_MCTS=1 走 MCTS。
 // 用开关而不是直接替换，是为了能同口径 A/B 对比，而不是假设"复杂方法一定更好"。
-const bool g_use_mcts = env_flag("ST_MCTS");
+// 部署默认：**有训练好的权重就走 MCTS**，因为网络只在 MCTS 路径上当根部先验。
+// 若沿用默认的 phase① 穷举搜索，网络根本不会被读取——传上去等于没带模型。
+// 没有权重（net_weights.h 未生成）时自动回退到 phase①，那条路径不需要网络。
+const bool g_use_mcts = env_flag("ST_MCTS") || brain::net_available();
 
 double env_double(const char* name, double fallback); // 定义见下方
 

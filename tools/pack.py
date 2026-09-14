@@ -33,10 +33,25 @@ FILES: list[tuple[str, str]] = [
     ("sim/state.h", "sim/state.h"),
     ("sim/rules.h", "sim/rules.h"),
     ("sim/rules.cpp", "sim/rules.cpp"),
+    ("sim/belief.h", "sim/belief.h"),
+    ("sim/belief.cpp", "sim/belief.cpp"),
+    ("obs/encode.h", "obs/encode.h"),
+    ("obs/encode.cpp", "obs/encode.cpp"),
     ("brain/eval.h", "brain/eval.h"),
     ("brain/eval.cpp", "brain/eval.cpp"),
+    ("brain/actions.h", "brain/actions.h"),
+    ("brain/actions.cpp", "brain/actions.cpp"),
     ("brain/search.h", "brain/search.h"),
     ("brain/search.cpp", "brain/search.cpp"),
+    ("brain/mcts.h", "brain/mcts.h"),
+    ("brain/mcts.cpp", "brain/mcts.cpp"),
+    ("brain/belief_state.h", "brain/belief_state.h"),
+    ("brain/belief_state.cpp", "brain/belief_state.cpp"),
+    ("brain/net.h", "brain/net.h"),
+    ("brain/net.cpp", "brain/net.cpp"),
+    # 训练产出的权重。没有它也能编译（会回退到手工评估），但那样传上去
+    # 等于没带模型 —— 所以打包时缺失应当报错，见 main() 的检查。
+    ("brain/net_weights.h", "brain/net_weights.h"),
     ("tools/pack_Makefile", "Makefile"),
 ]
 
