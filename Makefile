@@ -113,6 +113,15 @@ $(BUILD)/test_obs_v3: tests/test_obs_v3.cpp obs/encode_v3.cpp sim/rules.cpp $(HD
 test-obs-v3: $(BUILD)/test_obs_v3
 	$(BUILD)/test_obs_v3
 
+# —— 对局层差分：选手视图（Intel）必须与引擎一致 ——
+# 这是自对弈训练的前置门槛：sim 里的 last_known_pos 是真实位置，
+# 而引擎给选手的是记忆。弄错就是信息泄漏，而且不会报错。
+$(BUILD)/difftest_view: tests/difftest_view.cpp sim/view_mirror.cpp sim/rules.cpp $(HDRS) | engine
+	$(CXX) $(CXXFLAGS) $(filter %.cpp,$^) -o $@ $(ENGINE_LINK)
+
+test-view: $(BUILD)/difftest_view
+	$(BUILD)/difftest_view
+
 clean:
 	rm -rf $(BUILD)
 
