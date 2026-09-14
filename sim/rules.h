@@ -16,6 +16,12 @@ State make_initial_state(int size = kBoardSize);
 void facing_delta(char f, int& dx, int& dy);
 Pos mirror_pos(Pos p, int size);
 char mirror_facing(char f);
+
+// —— 局部视角 ——
+// 引擎 Match::view_for 对蓝方做 180° 镜像；我们把"我方"统一放到 red 槽位，
+// 因此双方的策略代码只需要写一份（这是整个工程最重要的一条约定）。
+State mirror_state(const State& s);
+State to_local(const State& world, char side);
 Pos spawn_of(char side, int size);
 char spawn_facing(char side);
 bool is_at_spawn(const State& s, char side);

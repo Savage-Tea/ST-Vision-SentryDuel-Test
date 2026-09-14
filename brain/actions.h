@@ -23,6 +23,51 @@ struct Cand {
     char arg = 0;
 };
 
+// 结束本方行动阶段的合成动作（"收手"）
+inline constexpr int kStopAction = -1;
+
+// —— 固定动作空间 ——
+// 策略网络的输出维度。把 (动作, 转向参数) 压成一个定长索引，
+// 这样策略头就是一个 8 维 softmax，训练侧不必处理变长动作。
+//   0=move  1..4=turn N/E/S/W  5=fire  6=scan  7=收手
+inline constexpr int kActionDim = 8;
+
+inline int cand_to_index(const Cand& c) {
+    switch (c.action) {
+        case sim::kMove: return 0;
+        case sim::kFire: return 5;
+        case sim::kScan: return 6;
+        case sim::kTurn:
+            switch (c.arg) {
+                case 'N': return 1;
+                case 'E': return 2;
+                case 'S': return 3;
+                case 'W': return 4;
+                default: return -1;
+            }
+        default: return 7; // kStopAction
+    }
+}
+
+inline Cand index_to_cand(int i) {
+    switch (i) {
+        case 0: return {sim::kMove, 0};
+        case 1: return {sim::kTurn, 'N'};
+        case 2: return {sim::kTurn, 'E'};
+        case 3: return {sim::kTurn, 'S'};
+        case 4: return {sim::kTurn, 'W'};
+        case 5: return {sim::kFire, 0};
+        case 6: return {sim::kScan, 0};
+        default: return {kStopAction, 0};
+    }
+}
+
+// 局部坐标动作 → 世界坐标。**只在自己直接驱动 sim 时需要**。
+// 驱动真实引擎时绝对不要调用：引擎的 turn() 收的就是局部朝向，
+// 它会在 Match::do_action 内部自己做镜像。这里再镜像一次就会反向 180°
+// ——这个坑已经踩过一次，整局报废。
+Cand local_to_world(const Cand& local, char side);
+
 // 本 act 内已被真机证明失败的行动。必须屏蔽，否则重规划会反复选中同一个
 // （典型情形：移动目标格被我们看不到的对手占着）。
 struct Bans {

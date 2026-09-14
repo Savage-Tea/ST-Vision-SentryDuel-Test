@@ -73,6 +73,13 @@ test-belief: $(BUILD)/test_belief
 test-ai: $(BUILD)/my_ai.so opponents-det
 	python3 tests/test_invariants.py
 
+# —— 坐标框架等变性（自对弈训练的正确性前提）——
+$(BUILD)/test_frame: tests/test_frame.cpp sim/rules.cpp sim/belief.cpp brain/actions.cpp brain/eval.cpp
+	$(CXX) $(CXXFLAGS) $^ -o $@
+
+test-frame: $(BUILD)/test_frame
+	$(BUILD)/test_frame
+
 clean:
 	rm -rf $(BUILD)
 

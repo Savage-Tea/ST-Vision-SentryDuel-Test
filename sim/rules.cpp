@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <utility>
 
 namespace sim {
 namespace {
@@ -120,6 +121,26 @@ char mirror_facing(char f) {
         case 'W': return 'E';
         default: return '?';
     }
+}
+
+State mirror_state(const State& s) {
+    State m = s;
+    m.red.last_known_pos = mirror_pos(s.red.last_known_pos, s.size);
+    m.blue.last_known_pos = mirror_pos(s.blue.last_known_pos, s.size);
+    m.red.last_known_facing = mirror_facing(s.red.last_known_facing);
+    m.blue.last_known_facing = mirror_facing(s.blue.last_known_facing);
+    for (Pos& o : m.obstacles) o = mirror_pos(o, s.size);
+    for (Pos& z : m.score_zones) z = mirror_pos(z, s.size);
+    return m;
+}
+
+State to_local(const State& world, char side) {
+    if (side == 'R') return world;
+    // 蓝方：先 180° 镜像，再把两个槽位互换，使"我方"始终落在 red 槽位。
+    // 互换之后：我方在局部坐标 (0,0) 朝 E，对手在 (6,6) 朝 W —— 与红方完全一致。
+    State m = mirror_state(world);
+    std::swap(m.red, m.blue);
+    return m;
 }
 
 Pos spawn_of(char side, int size) {

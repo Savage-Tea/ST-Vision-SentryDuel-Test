@@ -2,6 +2,14 @@
 
 namespace brain {
 
+Cand local_to_world(const Cand& local, char side) {
+    Cand c = local;
+    if (side == 'B' && c.action == sim::kTurn) {
+        c.arg = sim::mirror_facing(c.arg);
+    }
+    return c;
+}
+
 void collect_candidates(const sim::State& s, char side, bool free_turn,
                         bool can_see_enemy, const Bans* bans,
                         const sim::Belief* belief, std::vector<Cand>& out) {
