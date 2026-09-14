@@ -30,7 +30,55 @@ bool lane_clear_any_facing(const Sentry& shooter, const Pos& target,
     return false;
 }
 
-double evaluate(const sim::State& s, const Weights& w) {
+ThreatStats threat_stats(const sim::State& s, const sim::Belief& belief) {
+    ThreatStats stats;
+    const int n = belief.count();
+    if (n <= 0) return stats;
+    const Sentry& me = s.red;
+    // 锚点 = 最后已知位置，即对局状态里给搜索用的那个"代表位置"
+    const Pos anchor = s.blue.last_known_pos;
+
+    int threat = 0;
+    int unknown_total = 0;
+    int unknown_danger = 0;
+    for (int y = 0; y < sim::kBoardSize; ++y) {
+        for (int x = 0; x < sim::kBoardSize; ++x) {
+            if (!belief.has(x, y)) continue;
+            const Pos c{x, y};
+            // 对手在那里的话能否打到我？朝向未知 → 按最坏情况（任意朝向）
+            Sentry enemy{};
+            enemy.last_known_pos = c;
+            const bool can_hit = lane_clear_any_facing(enemy, me.last_known_pos, s.obstacles);
+            if (c.x == anchor.x && c.y == anchor.y) {
+                stats.danger_known = can_hit ? 1.0 : 0.0;
+            } else {
+                ++unknown_total;
+                if (can_hit) ++unknown_danger;
+            }
+            // 我在那里的话能否打到他？（用我方真实朝向）
+            if (lane_clear(me, c, s.obstacles)) ++threat;
+        }
+    }
+    // 锚点不在信念里时（例如击杀后锚点被重置），退化为按整集统计
+    if (unknown_total == 0) {
+        for (int y = 0; y < sim::kBoardSize; ++y)
+            for (int x = 0; x < sim::kBoardSize; ++x) {
+                if (!belief.has(x, y)) continue;
+                ++unknown_total;
+                Sentry enemy{};
+                enemy.last_known_pos = {x, y};
+                if (lane_clear_any_facing(enemy, me.last_known_pos, s.obstacles)) {
+                    ++unknown_danger;
+                }
+            }
+    }
+    stats.danger_unknown =
+        unknown_total > 0 ? static_cast<double>(unknown_danger) / unknown_total : 0.0;
+    stats.threat_prob = static_cast<double>(threat) / static_cast<double>(n);
+    return stats;
+}
+
+double evaluate(const sim::State& s, const Weights& w, const sim::Belief& belief) {
     // 局部框架下：red = 我方，blue = 对手
     const Sentry& me = s.red;
     const Sentry& opp = s.blue;
@@ -51,22 +99,27 @@ double evaluate(const sim::State& s, const Weights& w) {
     const int op_d = dist_to_zone(opp.last_known_pos, s.score_zones);
     v += w.w_dist * static_cast<double>(op_d - my_d);
 
-    // ③ 火力对峙。对手的朝向可能是过期情报，这里只用"最后已知朝向"，
-    //    结果偏乐观或偏悲观都不可避免——阶段③ 用 RNN 压历史正是为了解决它。
-    if (lane_clear(me, opp.last_known_pos, s.obstacles)) {
-        v += w.w_threat;
-        if (me.fire_cd == 0) v += w.w_ready;
-    }
-    // 危险项：对手朝向已知就按已知算；未知/过期则按最坏情况（任意朝向），
-    // 否则会默认自己是安全的——对手从视野外接近时这就是致命的乐观。
-    const bool danger = (opp.last_known_facing == '?')
-                            ? lane_clear_any_facing(opp, me.last_known_pos, s.obstacles)
-                            : lane_clear(opp, me.last_known_pos, s.obstacles);
-    if (danger) {
-        v -= w.w_danger;
-    }
+    // ③ 火力对峙：对**敌方可能位置集合**取期望，而不是只看最后已知的那一点。
+    //    这样"对手可能已经从视野外绕到我旁边"会如实体现在分数里。
+    const ThreatStats ts = threat_stats(s, belief);
+    v += w.w_threat * ts.threat_prob;
+    if (ts.threat_prob > 0.0 && me.fire_cd == 0) v += w.w_ready * ts.threat_prob;
+    // 确定的威胁给全权重；由信念推测出来的威胁打折，否则会瘫痪
+    v -= w.w_danger * ts.danger_known;
+    v -= w.w_danger * w.w_uncertain * ts.danger_unknown;
 
     return v;
+}
+
+double evaluate_for(const sim::State& s, const Weights& w, const sim::Belief& belief,
+                    char side) {
+    if (side == 'R') return evaluate(s, w, belief);
+    // 把双方对调再按同一套公式算，得到的就是"轮到 'B' 时这局面对他有多好"。
+    // 注意这不是简单取负：威胁/危险两项要换成从 'B' 的朝向与位置来算，
+    // 对调红蓝正好做到这一点。
+    sim::State flipped = s;
+    std::swap(flipped.red, flipped.blue);
+    return evaluate(flipped, w, belief);
 }
 
 } // namespace brain

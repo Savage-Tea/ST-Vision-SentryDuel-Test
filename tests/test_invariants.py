@@ -30,8 +30,15 @@ ENGINE = ROOT / "build" / "engine" / "runner"
 LIBDIR = ROOT / "build" / "engine"
 AI = ROOT / "build" / "my_ai.so"
 
-# 执红/执蓝的平均净胜分差距上限。镜像反了会是 ~40 分的落差，正常应该是个位数。
-MAX_COLOR_GAP = 12.0
+# 颜色对称的判据。
+#
+# 阈值定在 10 分是有依据的：跑引擎自带 AI 做对照，hunter 对 baseline 的红蓝
+# 净胜分落差约 7（红 +8.8 / 蓝 +1.9），baseline 自对弈近乎对称（-0.6）——
+# 也就是游戏本身的先手优势就值这个量级。超出它就不是"游戏固有不对称"了。
+#
+# 教训：曾经因为"两侧都赢、只是分差大"把这个阈值放宽到 25，结果漏掉了
+# 一次真实的颜色不对称回归（红 +34 / 蓝 -6）。两侧都赢 ≠ 对称。
+MAX_COLOR_GAP = 10.0
 
 failures: list[str] = []
 
@@ -76,14 +83,24 @@ def check_color_symmetry(opponent: Path) -> None:
         theirs = g["blue_score"] if ai_is_red else g["red_score"]
         margins[label] = mine - theirs
         print(f"      {label}：{mine}:{theirs}  净胜 {mine - theirs:+d}  ({g['winner']})")
+    losing = [label for label, m in margins.items() if m < MIN_MARGIN]
+    if losing:
+        failures.append(
+            f"颜色不对称：{'、'.join(losing)} 未能取胜"
+            f"（执红 {margins['执红']:+d}，执蓝 {margins['执蓝']:+d}）"
+            f" —— 蓝方镜像/坐标框架疑似有误")
+        print(f"      ❌ {'、'.join(losing)} 未取胜")
+    else:
+        print(f"      ✅ 两侧均取胜")
+
     gap = abs(margins["执红"] - margins["执蓝"])
     if gap > MAX_COLOR_GAP:
         failures.append(
-            f"颜色不对称：执红净胜 {margins['执红']:+d}，执蓝净胜 {margins['执蓝']:+d}，"
-            f"落差 {gap:.0f} > {MAX_COLOR_GAP:.0f}（蓝方镜像/坐标框架疑似有误）")
-        print(f"      ❌ 落差 {gap:.0f}，超过阈值 {MAX_COLOR_GAP:.0f}")
+            f"颜色落差过大：执红 {margins['执红']:+d} vs 执蓝 {margins['执蓝']:+d}，"
+            f"落差 {gap:.0f} > {MAX_COLOR_GAP:.0f}")
+        print(f"      ❌ 落差 {gap:.0f}，超过 {MAX_COLOR_GAP:.0f}")
     else:
-        print(f"      ✅ 落差 {gap:.0f}，在阈值 {MAX_COLOR_GAP:.0f} 内")
+        print(f"      ✅ 落差 {gap:.0f}，在 {MAX_COLOR_GAP:.0f} 内")
 
 
 def main() -> int:

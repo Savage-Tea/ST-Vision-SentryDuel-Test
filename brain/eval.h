@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include "sim/belief.h"
 #include "sim/rules.h"
 
 namespace brain {
@@ -27,6 +28,10 @@ struct Weights {
     // 与"不浪费"之间的平局——没有它，搜索会选出 TURN 来 TURN 去这类
     // 状态不变却照常消耗额度的方案（它们的评估值与什么都不做完全相同）。
     double w_waste = 0.02;
+
+    // 「信念推测出的危险」相对「锚点处确定的危险」的折扣。0 = 完全忽略推测
+    // （退化为 v1 的单点危险）；1 = 与确定威胁同等对待（会瘫痪）。
+    double w_uncertain = 0.25;
 };
 
 // 对手的 fire_cd / scan_cd 在观测里恒为 -1（引擎不暴露），
@@ -45,7 +50,29 @@ bool lane_clear(const Sentry& shooter, const Pos& target,
 bool lane_clear_any_facing(const Sentry& shooter, const Pos& target,
                            const std::vector<Pos>& obstacles);
 
-// 局面评估，分数越高对我方越有利
-double evaluate(const sim::State& s, const Weights& w);
+// 基于敌方**可能位置集合**的危险/机会统计。
+//
+// 这里刻意把危险拆成两档，因为把它们混成一个"信念占比"会造成**不确定性瘫痪**：
+// 看不见对手时信念会覆盖几十格，占比饱和成一个常值，于是连必须守的得分区
+// 也会被判成危险区，AI 就再也不敢进场了（实测：对 baseline 从 0.525 掉到 0.21）。
+//
+//   danger_known   —— 最后已知位置（锚点）处就能打到我。这是"他就在那儿瞄着我"，
+//                     近乎确定的击杀，给全权重。
+//   danger_unknown —— 信念中其余位置可能打到我。这是推测，给 w_uncertain 折扣。
+struct ThreatStats {
+    double danger_known = 0.0;   // 锚点处的威胁：0 或 1
+    double danger_unknown = 0.0; // 信念中除锚点外的格子能打到我的占比
+    double threat_prob = 0.0;    // 信念中落在我方火力范围内的格子占比
+};
+
+ThreatStats threat_stats(const sim::State& s, const sim::Belief& belief);
+
+// 局面评估，分数越高对我方越有利。belief 为敌方可能位置集合。
+double evaluate(const sim::State& s, const Weights& w, const sim::Belief& belief);
+
+// 从任意一方的视角评估（MCTS 的负极大值回传需要它：
+// 树里既有我方走子的节点也有对手走子的节点，叶值必须按"轮到谁"取视角）。
+double evaluate_for(const sim::State& s, const Weights& w, const sim::Belief& belief,
+                    char side);
 
 } // namespace brain

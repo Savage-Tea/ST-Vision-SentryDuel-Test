@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "brain/actions.h"
 #include "brain/eval.h"
 
 #include <chrono>
@@ -35,28 +36,19 @@ struct TurnInput {
     static constexpr int kMaxBans = 6;
 
     sim::State state;
+    // 敌方可能位置集合。搜索会随我方行动后的视野证伪不断收缩它，
+    // 所以"走到能看见更多地方的位置"本身就变得有价值。
+    sim::Belief belief;
     int used_by_now = 0;             // 本回合已经消耗掉的额度（分叉重规划时 > 0）
     bool free_turn_available = false; // 出生点免费转向是否仍可能可用
     bool enemy_visible = false;      // 本回合是否真的看得见（含 SCAN 临时视野）
 
     // 本 act 内已被真机证明失败的行动。必须屏蔽掉，否则重规划会反复选中
     // 同一个动作（典型情形：移动目标格被我们看不到的对手占着）。
-    int ban_actions[kMaxBans] = {0, 0, 0, 0, 0, 0};
-    char ban_args[kMaxBans] = {0, 0, 0, 0, 0, 0};
-    int ban_count = 0;
+    Bans bans;
 
-    void ban(int action, char arg) {
-        if (ban_count >= kMaxBans) return;
-        ban_actions[ban_count] = action;
-        ban_args[ban_count] = arg;
-        ++ban_count;
-    }
-    bool is_banned(int action, char arg) const {
-        for (int i = 0; i < ban_count; ++i) {
-            if (ban_actions[i] == action && ban_args[i] == arg) return true;
-        }
-        return false;
-    }
+    void ban(int action, char arg) { bans.add(action, arg); }
+    bool is_banned(int action, char arg) const { return bans.has(action, arg); }
 };
 
 struct SearchStats {

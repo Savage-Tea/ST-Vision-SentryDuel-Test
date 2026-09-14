@@ -43,7 +43,8 @@ $(BUILD)/opponents/det_ai_%.so: $(SENTRY_DUEL_ROOT)/engine/tests/det_ai_%.cpp
 	$(CXX) $(CXXFLAGS) -shared -Wl,-z,lazy -Wl,--allow-shlib-undefined $< -o $@
 
 # —— 我们的 AI（阶段①：搜索 + policy model）——
-AI_SRC := agent/act.cpp brain/eval.cpp brain/search.cpp sim/rules.cpp
+AI_SRC := agent/act.cpp brain/eval.cpp brain/actions.cpp brain/search.cpp \
+          brain/mcts.cpp sim/rules.cpp sim/belief.cpp
 
 $(BUILD)/my_ai.so: $(AI_SRC) | engine
 	$(CXX) $(CXXFLAGS) -shared -Wl,-z,lazy -Wl,--allow-shlib-undefined \
@@ -60,6 +61,17 @@ test: $(BUILD)/difftest_rules
 
 test-quick: $(BUILD)/difftest_rules
 	$(BUILD)/difftest_rules --quick
+
+# —— 信念单元测试 ——
+$(BUILD)/test_belief: tests/test_belief.cpp sim/belief.cpp sim/rules.cpp
+	$(CXX) $(CXXFLAGS) $^ -o $@
+
+test-belief: $(BUILD)/test_belief
+	$(BUILD)/test_belief
+
+# —— AI 不变量回归（确定性 + 颜色对称）——
+test-ai: $(BUILD)/my_ai.so opponents-det
+	python3 tests/test_invariants.py
 
 clean:
 	rm -rf $(BUILD)
