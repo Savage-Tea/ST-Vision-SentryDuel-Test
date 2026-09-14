@@ -85,10 +85,15 @@ def main() -> int:
         futures = [pool.submit(play, r, bl, args.max_turns) for r, bl, _ in schedule]
         raw = [f.result() for f in futures]
 
-    wins = draws = losses = 0
     crashes = a_timeouts = b_timeouts = 0
-    score_margin = 0
     reasons: dict[str, int] = {}
+    # 分色统计。**必须分色**：这个游戏的先手优势极强，聚合数字会把
+    # "执红全胜 + 执蓝全负"显示成一个看着中立的 0.500。
+    # 实测踩过：同一份 .so 对 baseline 报了"100 胜 100 负、净胜分 +14.80"，
+    # 实际是执红 100 局全胜（大比分）、执蓝 100 局全负（小比分）。
+    stats = {"R": {"wins": 0, "draws": 0, "losses": 0, "margin": 0},
+             "B": {"wins": 0, "draws": 0, "losses": 0, "margin": 0}}
+
     for (_, _, a_is_red), g in zip(schedule, raw):
         if g["returncode"] != 0 or g["winner"] is None:
             crashes += 1
@@ -100,18 +105,36 @@ def main() -> int:
 
         a_score = g["red_score"] if a_is_red else g["blue_score"]
         b_score = g["blue_score"] if a_is_red else g["red_score"]
-        score_margin += a_score - b_score
 
+        st = stats["R" if a_is_red else "B"]
+        st["margin"] += a_score - b_score
         if g["winner"] == "D":
-            draws += 1
+            st["draws"] += 1
         elif (g["winner"] == "R") == a_is_red:
-            wins += 1
+            st["wins"] += 1
         else:
-            losses += 1
+            st["losses"] += 1
 
+    wins = sum(s["wins"] for s in stats.values())
+    draws = sum(s["draws"] for s in stats.values())
+    losses = sum(s["losses"] for s in stats.values())
     played = wins + draws + losses
     if played == 0:
         sys.exit("没有一局正常结束")
+
+    def rate(st: dict) -> float:
+        n = st["wins"] + st["draws"] + st["losses"]
+        return (st["wins"] + 0.5 * st["draws"]) / n if n else float("nan")
+
+    score_margin = sum(s["margin"] for s in stats.values())
+    by_color = {
+        c: {**s, "played": s["wins"] + s["draws"] + s["losses"],
+            "score_rate": rate(s),
+            "avg_margin": s["margin"] / (s["wins"] + s["draws"] + s["losses"])
+            if (s["wins"] + s["draws"] + s["losses"]) else float("nan")}
+        for c, s in stats.items()
+    }
+    color_gap = abs(by_color["R"]["score_rate"] - by_color["B"]["score_rate"])
 
     summary = {
         "a": str(a), "b": str(b), "played": played,
@@ -119,6 +142,9 @@ def main() -> int:
         "score_rate": (wins + 0.5 * draws) / played,
         "win_rate": wins / played,
         "avg_margin": score_margin / played,
+        "by_color": {c: {k: v for k, v in d.items() if k != "margin"}
+                     for c, d in by_color.items()},
+        "color_gap": color_gap,
         "a_timeouts": a_timeouts, "b_timeouts": b_timeouts, "crashes": crashes,
         "reasons": reasons,
     }
@@ -129,6 +155,15 @@ def main() -> int:
     print(f"  胜 {wins}  平 {draws}  负 {losses}")
     print(f"  综合得分率 {(wins + 0.5 * draws) / played:.4f}"
           f"   胜率 {wins / played:.4f}   平均净胜分 {score_margin / played:+.2f}")
+    for c, label in (("R", "执红"), ("B", "执蓝")):
+        d = by_color[c]
+        print(f"    {label} {d['played']:4d} 局  胜 {d['wins']:4d} 平 {d['draws']:3d}"
+              f" 负 {d['losses']:4d}   得分率 {d['score_rate']:.4f}"
+              f"   净胜分 {d['avg_margin']:+.2f}")
+    if color_gap > 0.25:
+        print(f"  ⚠ 颜色严重不对称：执红 {by_color['R']['score_rate']:.4f}"
+              f" vs 执蓝 {by_color['B']['score_rate']:.4f}（差 {color_gap:.4f}）"
+              f"—— 聚合数字会掩盖这件事，别只看上面那行")
     print(f"  A 超时 {a_timeouts}   B 超时 {b_timeouts}   异常退出 {crashes}")
     print(f"  结束原因 {reasons}")
 
