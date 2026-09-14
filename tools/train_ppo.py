@@ -44,6 +44,17 @@ from tools import sdpp  # noqa: E402
 
 WEIGHTS_HEADER = ROOT / "brain" / "policy_weights.h"
 
+# 输出改为行缓冲。
+#
+# 默认情况下 stdout 重定向到文件时是**块缓冲**，而这个脚本每轮只打印不到
+# 十行——缓冲区永远填不满，于是整个训练过程在日志里是**完全看不见的**，
+# 要等进程退出才一次性刷出来。监控长跑时这等于瞎着眼睛等，也分不清
+# "在算"和"卡住了"。同一个坑在 train_mlp.py 上已经踩过一次。
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except AttributeError:  # pragma: no cover - 极老的 Python
+    pass
+
 
 def pad_sequences(seqs, max_len=None):
     """把变长序列补到等长，返回 (obs, action, reward, mask)。
