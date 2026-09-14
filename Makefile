@@ -14,6 +14,18 @@ CXXFLAGS := -std=c++17 -O2 -fPIC -Wall -Wextra -MMD -MP -I. -I$(ENGINE_INC)
 
 ENGINE_LINK := -L$(ENGINE_BUILD) -lsentry_duel_engine -Wl,-rpath,'$$ORIGIN/engine' -ldl
 
+# 所有头文件都当作先决条件，**刻意不依赖 -MMD 的自动依赖**。
+#
+# 为什么不靠 -MMD：下面的规则是**一次 g++ 调用编译多个 .cpp**，而 GCC 在
+# 这种模式下只会写出其中一个源文件的依赖（实测只剩最后一个），于是
+# obs/brain/sim 下任何头文件的改动都不会触发重编。本项目全是 header+source
+# 结构，这个洞意味着：改了观测布局或评估权重，make 会安静地拿着旧产物去跑
+# 测试、甚至把过期的 .so 传上平台。实测确认过：touch obs/encode_v3.h 后
+# make 不重编。
+#
+# 本项目编译只要几秒，宁可多编一次，也不要用旧二进制。
+HDRS := $(shell find . -name '*.h' -not -path './build/*' 2>/dev/null)
+
 .PHONY: all engine opponents ai test test-quick clean
 
 all: engine opponents ai
@@ -47,15 +59,15 @@ AI_SRC := agent/act.cpp brain/eval.cpp brain/actions.cpp brain/search.cpp \
           brain/mcts.cpp brain/belief_state.cpp brain/net.cpp \
           obs/encode.cpp sim/rules.cpp sim/belief.cpp
 
-$(BUILD)/my_ai.so: $(AI_SRC) | engine
+$(BUILD)/my_ai.so: $(AI_SRC) $(HDRS) | engine
 	$(CXX) $(CXXFLAGS) -shared -Wl,-z,lazy -Wl,--allow-shlib-undefined \
 	    $(AI_SRC) -o $@ $(ENGINE_LINK)
 
 ai: $(BUILD)/my_ai.so
 
 # —— 差分测试：sim 必须与引擎规则核心逐字段一致 ——
-$(BUILD)/difftest_rules: tests/difftest_rules.cpp sim/rules.cpp | engine
-	$(CXX) $(CXXFLAGS) $^ -o $@ $(ENGINE_LINK)
+$(BUILD)/difftest_rules: tests/difftest_rules.cpp sim/rules.cpp $(HDRS) | engine
+	$(CXX) $(CXXFLAGS) $(filter %.cpp,$^) -o $@ $(ENGINE_LINK)
 
 test: $(BUILD)/difftest_rules
 	$(BUILD)/difftest_rules
@@ -64,8 +76,8 @@ test-quick: $(BUILD)/difftest_rules
 	$(BUILD)/difftest_rules --quick
 
 # —— 信念单元测试 ——
-$(BUILD)/test_belief: tests/test_belief.cpp sim/belief.cpp sim/rules.cpp
-	$(CXX) $(CXXFLAGS) $^ -o $@
+$(BUILD)/test_belief: tests/test_belief.cpp sim/belief.cpp sim/rules.cpp $(HDRS)
+	$(CXX) $(CXXFLAGS) $(filter %.cpp,$^) -o $@
 
 test-belief: $(BUILD)/test_belief
 	$(BUILD)/test_belief
@@ -75,11 +87,31 @@ test-ai: $(BUILD)/my_ai.so opponents-det
 	python3 tests/test_invariants.py
 
 # —— 坐标框架等变性（自对弈训练的正确性前提）——
-$(BUILD)/test_frame: tests/test_frame.cpp sim/rules.cpp sim/belief.cpp brain/actions.cpp brain/eval.cpp
-	$(CXX) $(CXXFLAGS) $^ -o $@
+$(BUILD)/test_frame: tests/test_frame.cpp sim/rules.cpp sim/belief.cpp brain/actions.cpp brain/eval.cpp $(HDRS)
+	$(CXX) $(CXXFLAGS) $(filter %.cpp,$^) -o $@
 
 test-frame: $(BUILD)/test_frame
 	$(BUILD)/test_frame
+
+# —— 阶段③ 循环策略网络：GRU 前向的差分测试（C++ 侧）——
+# 权重由 tools/difftest_policy.py 在编译**之前**导出，所以这里刻意**不**把
+# brain/policy_weights.h 写成先决条件：那样 make 会认为产物已是最新而不重编，
+# 拿到的就是上一轮导出的权重。脚本每次都会 rm 掉二进制再编。
+$(BUILD)/difftest_policy: tests/difftest_policy.cpp brain/policy_net.cpp $(HDRS)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $(filter %.cpp,$^) -o $@
+
+# Python 驱动负责：导出权重 → 生成用例 → 编译 → 比对
+test-policy:
+	python3 tools/difftest_policy.py
+
+# —— obs v3 编码：布局 + 180° 旋转等变 ——
+$(BUILD)/test_obs_v3: tests/test_obs_v3.cpp obs/encode_v3.cpp sim/rules.cpp $(HDRS)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $(filter %.cpp,$^) -o $@
+
+test-obs-v3: $(BUILD)/test_obs_v3
+	$(BUILD)/test_obs_v3
 
 clean:
 	rm -rf $(BUILD)
@@ -91,7 +123,7 @@ SELFPLAY_SRC := selfplay/selfplay.cpp brain/eval.cpp brain/actions.cpp \
                 brain/search.cpp brain/mcts.cpp brain/belief_state.cpp \
                 obs/encode.cpp brain/net.cpp sim/rules.cpp sim/belief.cpp
 
-$(BUILD)/selfplay: $(SELFPLAY_SRC)
+$(BUILD)/selfplay: $(SELFPLAY_SRC) $(HDRS)
 	$(CXX) $(CXXFLAGS) $(SELFPLAY_SRC) -o $@ -pthread
 
 selfplay: $(BUILD)/selfplay

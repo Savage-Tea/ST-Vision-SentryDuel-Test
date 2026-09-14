@@ -26,5 +26,11 @@ checkpoints/
 *.swp
 *.swo
 
-# 训练产出的权重（由 tools/train_mlp.py 生成）
+# 训练产出的权重（生成产物）
+#   net_weights.h    —— 阶段② 的 MLP，由 tools/train_mlp.py 导出
+#   policy_weights.h —— 阶段③ 的 GRU，由 tools/policy_net.py 导出
+# 两者都是生成产物，但要编译出**带模型**的 .so 就必须存在；
+# 缺失时 brain/net.h 与 brain/policy_net.h 会走"无网络"分支，
+# 仍能构建和运行，只是没有策略。
 brain/net_weights.h
+brain/policy_weights.h
