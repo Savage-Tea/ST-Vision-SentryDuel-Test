@@ -19,8 +19,15 @@ BUDGET_MS=${BUDGET_MS:-20}
 EPOCHS=${EPOCHS:-15}
 DATA=${DATA:-build/selfplay_out/round1.bin}
 
+build() { # 构建并**真的检查产物**——之前 grep 加 || true 把编译失败吞掉了
+    local log
+    log=$(make ai selfplay 2>&1) || { echo "$log" | tail -20; echo "构建失败"; exit 1; }
+    echo "$log" | grep -E "error|warning" || true
+    [ -f build/my_ai.so ] && [ -f build/selfplay ] || { echo "构建未产出预期文件"; exit 1; }
+}
+
 echo "=== [1/5] 构建 ==="
-make ai selfplay 2>&1 | grep -E "error|warning" || true
+build
 
 echo
 echo "=== [2/5] 自对弈生成: $GAMES 局 / $THREADS 线程 / 每步 ${BUDGET_MS}ms ==="
@@ -34,7 +41,7 @@ python3 tools/train_mlp.py --data "$DATA" --epochs "$EPOCHS" --out build/net.npz
 
 echo
 echo "=== [4/5] 用训练出的权重重建 ==="
-make ai selfplay 2>&1 | grep -E "error|warning" || true
+build
 
 echo
 echo "=== [5/5] 校验网络已被加载 ==="

@@ -16,9 +16,16 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import os
 import struct
 import sys
 from pathlib import Path
+
+# 必须在 import torch 之前设置。
+# 昇腾节点上装了 torch_npu，torch 会在导入时自动加载设备后端；若没 source
+# CANN 环境（libhccl.so 找不到），整个 import 直接失败。我们这个网络很小，
+# CPU 训练足够，也不该让脚本依赖外部环境有没有 source 过。
+os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
 
 import numpy as np
 import torch
@@ -100,12 +107,23 @@ def export_header(net: Net, path: Path) -> None:
         "",
     ]
 
+    def literal(v: float) -> str:
+        # C++ 里 0f / 1f 不是合法字面量，必须有小数点或指数，所以补 .0。
+        # 另外权值若出现 inf/nan 会让编译直接失败，这里挡掉并报数。
+        if not np.isfinite(v):
+            literal.bad += 1
+            return "0.0f"
+        s = f"{v:.9g}"
+        if not any(ch in s for ch in ".eE"):
+            s += ".0"
+        return s + "f"
+
     def emit(name: str, arr: np.ndarray) -> None:
         flat = arr.reshape(-1).astype(np.float32)
         lines.append(f"static const float {name}[{flat.size}] = {{")
         chunk = []
-        for i, v in enumerate(flat):
-            chunk.append(f"{v:.9g}f")
+        for v in flat:
+            chunk.append(literal(float(v)))
             if len(chunk) == 8:
                 lines.append("    " + ",".join(chunk) + ",")
                 chunk = []
@@ -113,6 +131,8 @@ def export_header(net: Net, path: Path) -> None:
             lines.append("    " + ",".join(chunk) + ",")
         lines.append("};")
         lines.append("")
+
+    literal.bad = 0
 
     emit("kW1", sd["fc1.weight"])
     emit("kB1", sd["fc1.bias"])
@@ -123,13 +143,15 @@ def export_header(net: Net, path: Path) -> None:
     emit("kWv", sd["v.weight"])
     emit("kBv", sd["v.bias"])
 
+    if literal.bad:
+        print(f"  ⚠ 有 {literal.bad} 个非有限权值，已写成 0（训练可能发散了）")
     path.write_text("\n".join(lines))
     print(f"  权重头文件 {path.relative_to(ROOT)}  ({path.stat().st_size/1024:.0f} KB)")
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data", required=True, help="selfplay 生成的 .bin")
+    ap.add_argument("--data", default="", help="selfplay 生成的 .bin（--export-only 时不需要）")
     ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument("--batch", type=int, default=1024)
     ap.add_argument("--lr", type=float, default=3e-4)
@@ -138,7 +160,22 @@ def main() -> int:
     ap.add_argument("--out", default="build/net.npz")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--threads", type=int, default=0, help="0 = 用满 CPU")
+    ap.add_argument("--export-only", action="store_true",
+                    help="不训练，直接从 --out 的检查点导出权重头文件")
     args = ap.parse_args()
+
+    if args.export_only:
+        ckpt = ROOT / args.out if not Path(args.out).is_absolute() else Path(args.out)
+        if not ckpt.exists():
+            sys.exit(f"检查点不存在: {ckpt}")
+        net = Net()
+        net.load_state_dict(torch.load(ckpt, map_location="cpu"))
+        print(f"从检查点导出 {ckpt}")
+        export_header(net, WEIGHTS_HEADER)
+        return 0
+
+    if not args.data:
+        sys.exit("训练需要 --data（或用 --export-only 只导出）")
 
     if args.threads > 0:
         torch.set_num_threads(args.threads)
