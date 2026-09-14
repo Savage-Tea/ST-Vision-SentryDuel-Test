@@ -1,0 +1,351 @@
+// agent/act.cpp —— 选手 .so 的 act() 入口（阶段①：搜索 + policy model）
+//
+// 一个 act() 内的流程：
+//   ① 把引擎给的视图转成「我方为 'R'」的局部坐标状态（引擎已对蓝方镜像，
+//      所以红蓝双方共用同一份策略代码，不需要任何按颜色的分支）
+//   ② 逐步决策：每执行一个行动前都重新规划一次（搜索很快，重新规划最省心）
+//      —— 这样"最后已知敌情"与真实的任何偏差都会被下一步立刻纠正，
+//      而不是把一份基于错误前提的计划执行到底
+//   ③ 每次行动后用真实观测校验 sim 的预测；不符则用真实观测重建状态
+//   ④ 任何异常/超时都退回绝对安全的启发式
+//
+// 时间预算是硬约束：引擎给 1 秒，超时 = 本回合剩余行动作废 + 送对手 1 分。
+
+#include "brain/eval.h"
+#include "brain/search.h"
+#include "sim/rules.h"
+#include "sentry_duel.h"
+
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+
+namespace {
+
+using Clock = std::chrono::steady_clock;
+
+// 引擎硬性 1 秒。留足余量：实测搜索只需几百微秒，350ms 是极宽松的上限，
+// 真正的意义是在异常情况下保证一定不超时。
+constexpr int kDefaultBudgetMs = 350;
+constexpr int kMaxFailedAttempts = 4;
+
+int env_int(const char* name, int fallback) {
+    const char* v = std::getenv(name);
+    if (v == nullptr || *v == '\0') return fallback;
+    const int n = std::atoi(v);
+    return n > 0 ? n : fallback;
+}
+
+bool env_flag(const char* name) {
+    const char* v = std::getenv(name);
+    return v != nullptr && *v != '\0' && *v != '0';
+}
+
+const int g_budget_ms = env_int("ST_BUDGET_MS", kDefaultBudgetMs);
+const bool g_debug = env_flag("ST_DEBUG");
+
+// 权重可通过环境变量覆盖，用于离线调参；未设置时用编译期默认值。
+// 平台评测时环境里没有这些变量，所以线上行为完全由默认值决定。
+double env_double(const char* name, double fallback) {
+    const char* v = std::getenv(name);
+    if (v == nullptr || *v == '\0') return fallback;
+    char* end = nullptr;
+    const double d = std::strtod(v, &end);
+    return (end != nullptr && end != v) ? d : fallback;
+}
+
+brain::Weights load_weights() {
+    brain::Weights w;
+    w.w_diff = env_double("ST_W_DIFF", w.w_diff);
+    w.w_zone = env_double("ST_W_ZONE", w.w_zone);
+    w.w_dist = env_double("ST_W_DIST", w.w_dist);
+    w.w_threat = env_double("ST_W_THREAT", w.w_threat);
+    w.w_danger = env_double("ST_W_DANGER", w.w_danger);
+    w.w_ready = env_double("ST_W_READY", w.w_ready);
+    w.w_waste = env_double("ST_W_WASTE", w.w_waste);
+    return w;
+}
+
+brain::Weights g_weights = load_weights();
+
+struct Memory {
+    int last_turn = -1;
+    Pos last_my_pos{-1, -1};
+    Pos enemy_belief{-1, -1};
+    char enemy_belief_facing = '?';
+    bool enemy_belief_valid = false;
+};
+Memory g_mem;
+
+// 从引擎视图构造「我方为 'R'」的局部状态。
+// 引擎已对蓝方做 180° 镜像，所以蓝方看到的 board.blue 就是局部坐标下的自己。
+sim::State local_state(const Board& b, char side) {
+    sim::State st = sim::make_initial_state(b.size);
+    st.turn = b.turn;
+    st.obstacles = b.obstacles;
+    st.score_zones = b.score_zones;
+    st.red = (side == 'R') ? b.red : b.blue;   // 我方
+    st.blue = (side == 'R') ? b.blue : b.red;  // 对手
+    // sim::make_initial_state 会写入默认地图，这里必须覆盖成真实地图
+    return st;
+}
+
+// 维护敌方位置信念。
+//
+// 引擎的情报只在"看得见"时更新；而我们击杀对手后，自己能推算出他回了出生点。
+// 所以我们的信念比引擎的情报更准，只在看不见时才用引擎的值兜底。
+void update_belief(sim::State& st, bool visible_now) {
+    if (visible_now) {
+        g_mem.enemy_belief = st.blue.last_known_pos;
+        g_mem.enemy_belief_facing = st.blue.last_known_facing;
+        g_mem.enemy_belief_valid = true;
+    } else if (!g_mem.enemy_belief_valid && st.blue.last_known_pos.x >= 0) {
+        g_mem.enemy_belief = st.blue.last_known_pos;
+        g_mem.enemy_belief_facing = st.blue.last_known_facing;
+        g_mem.enemy_belief_valid = true;
+    }
+    if (!g_mem.enemy_belief_valid) {
+        // 从未得知：开局时对手确实在其出生点（局部坐标 (6,6)）
+        g_mem.enemy_belief = sim::spawn_of('B', st.size);
+        g_mem.enemy_belief_facing = sim::spawn_facing('B');
+        g_mem.enemy_belief_valid = true;
+    }
+    st.blue.last_known_pos = g_mem.enemy_belief;
+    st.blue.last_known_facing = g_mem.enemy_belief_facing;
+    // 对手的 CD 引擎不暴露（恒为 -1），搜索里按保守值处理
+    st.blue.fire_cd = brain::kAssumedEnemyFireCd;
+    st.blue.scan_cd = 0;
+}
+
+bool same_my_state(const Sentry& predicted, const ActionObservation& obs) {
+    return predicted.last_known_pos.x == obs.my_pos.x &&
+           predicted.last_known_pos.y == obs.my_pos.y &&
+           predicted.last_known_facing == obs.my_facing &&
+           predicted.fire_cd == obs.fire_cd && predicted.scan_cd == obs.scan_cd;
+}
+
+struct Executed {
+    bool success = false;
+    bool consumed = false;
+    ActionObservation obs{};
+};
+
+Executed execute(int action, char world_arg) {
+    Executed e;
+    if (action == sim::kMove) {
+        const ActionResult r = move();
+        e.success = r.success;
+        e.consumed = r.consumed;
+        e.obs = r.observation;
+    } else if (action == sim::kTurn) {
+        const ActionResult r = turn(world_arg);
+        e.success = r.success;
+        e.consumed = r.consumed;
+        e.obs = r.observation;
+    } else if (action == sim::kFire) {
+        const ActionResult r = fire();
+        e.success = r.success;
+        e.consumed = r.consumed;
+        e.obs = r.observation;
+    } else {
+        const ScanResult r = scan();
+        e.success = r.success;
+        e.consumed = r.consumed;
+        e.obs = r.observation;
+    }
+    return e;
+}
+
+void run(const Board& board, char my_color) {
+    const Clock::time_point deadline = Clock::now() + std::chrono::milliseconds(g_budget_ms);
+
+    // 新对局：重置跨回合记忆（同进程只跑一局，这里是防御性写法）
+    if (board.turn == 0 || board.turn < g_mem.last_turn) g_mem = Memory{};
+
+    sim::State st = local_state(board, my_color);
+    bool enemy_visible = st.blue.visible;
+
+    // 免费转向估计：开局，或刚从别处被击回出生点。
+    // 引擎不暴露该状态，但"位置突然变成出生点"是唯一能瞬移的情形，可据此判定。
+    const Pos my_spawn = sim::spawn_of('R', st.size);
+    const bool at_spawn =
+        (st.red.last_known_pos.x == my_spawn.x && st.red.last_known_pos.y == my_spawn.y);
+    const bool was_at_spawn =
+        (g_mem.last_my_pos.x == my_spawn.x && g_mem.last_my_pos.y == my_spawn.y);
+    bool free_turn = (board.turn == 0) || (at_spawn && !was_at_spawn);
+
+    update_belief(st, enemy_visible);
+
+    brain::TurnInput in;
+    int used = 0;
+    int failures = 0;
+
+    // 信息优先：看不见对手且雷达就绪，就先扫。
+    //
+    // 为什么不让搜索自己决定？因为在"点为信念"下搜索**无法给 SCAN 定价**：
+    // 模拟中扫描只改 scan_cd、不改变敌方位置，于是它在评估函数眼里是纯亏，
+    // 永远不会被选中。而实战里不扫描就等于闭着眼走进对手的枪口。
+    // 阶段③ 的 RNN 能从历史维持信念，届时这条规则会被真正的信息价值取代。
+    if (!enemy_visible && st.red.scan_cd == 0) {
+        const Executed e = execute(sim::kScan, 0);
+        if (e.success) {
+            if (e.consumed) ++used;
+            st.red.scan_cd = e.obs.scan_cd;
+            if (e.obs.opp_visible) {
+                st.blue.last_known_pos = e.obs.opp_last_known_pos;
+                st.blue.last_known_facing = e.obs.opp_last_known_facing;
+                st.blue.visible = true;
+                enemy_visible = true;
+                g_mem.enemy_belief = e.obs.opp_last_known_pos;
+                g_mem.enemy_belief_facing = e.obs.opp_last_known_facing;
+                g_mem.enemy_belief_valid = true;
+            }
+        }
+    }
+
+    while (used < brain::kMaxActions && Clock::now() < deadline) {
+        in.state = st;
+        in.used_by_now = used;
+        in.free_turn_available = free_turn;
+        in.enemy_visible = enemy_visible;
+
+        brain::SearchStats stats;
+        const brain::Plan plan = brain::search_turn(in, g_weights, deadline, &stats);
+        if (g_debug) {
+            const char* kNames[] = {"move", "turn", "fire", "scan"};
+            const int a0 = plan.count > 0 ? plan.actions[0] : -1;
+            std::fprintf(stderr,
+                         "[ai] side=%c turn=%d used=%d vis=%d free=%d me=(%d,%d)%c "
+                         "bel=(%d,%d)%c our=%lld opp=%lld refined=%lld exh=%d "
+                         "value=%.3f plan=%d act=%s%c\n",
+                         my_color, board.turn, used, static_cast<int>(enemy_visible),
+                         static_cast<int>(free_turn), st.red.last_known_pos.x,
+                         st.red.last_known_pos.y, st.red.last_known_facing,
+                         st.blue.last_known_pos.x, st.blue.last_known_pos.y,
+                         st.blue.last_known_facing, stats.our_nodes, stats.opp_nodes,
+                         stats.refined, static_cast<int>(stats.time_exhausted), plan.value,
+                         plan.count,
+                         a0 >= 0 ? kNames[a0] : "none",
+                         (a0 == sim::kTurn && plan.count > 0) ? plan.args[0] : ' ');
+        }
+        if (!plan.valid || plan.count == 0) break;
+
+        const int action = plan.actions[0];
+        const char local_arg = plan.args[0];
+        // 【重要】turn() 接收的是**局部**朝向：引擎在 Match::do_action 内部
+        // 自己会做 world_facing(local_arg, side) 的镜像转换（match.cpp:240）。
+        // 这里若再镜像一次，蓝方就会被反向转 180°，整局报废。
+        const char world_arg = local_arg;
+
+        // 先用 sim 推演期望结果：这样分数、CD、以及"击杀后对手回出生点"
+        // 都能被正确推进，比只看观测更完整
+        sim::State predicted = st;
+        sim::apply_action(predicted, 'R', action, local_arg);
+
+        const Executed e = execute(action, world_arg);
+
+        if (!e.success) {
+            // 失败不消耗额度。屏蔽掉这个动作，否则重规划会反复选中它。
+            in.ban(action, local_arg);
+            ++failures;
+
+            // 移动失败 = 目标格被我们看不见的对手占着 —— 这是关于敌位最强的情报
+            if (action == sim::kMove) {
+                int dx = 0;
+                int dy = 0;
+                sim::facing_delta(st.red.last_known_facing, dx, dy);
+                g_mem.enemy_belief = {st.red.last_known_pos.x + dx,
+                                      st.red.last_known_pos.y + dy};
+                g_mem.enemy_belief_facing = '?'; // 位置确定，朝向仍未知
+                g_mem.enemy_belief_valid = true;
+                update_belief(st, false);
+            }
+            if (failures >= kMaxFailedAttempts) break;
+            continue;
+        }
+
+        if (same_my_state(predicted.red, e.obs)) {
+            st = predicted;
+        } else {
+            // 模型与真机不符（例如敌位判断有误）→ 用真实观测重建，下一轮重新规划
+            st.red.last_known_pos = e.obs.my_pos;
+            st.red.last_known_facing = e.obs.my_facing;
+            st.red.fire_cd = e.obs.fire_cd;
+            st.red.scan_cd = e.obs.scan_cd;
+        }
+
+        if (e.obs.opp_visible) {
+            st.blue.last_known_pos = e.obs.opp_last_known_pos;
+            st.blue.last_known_facing = e.obs.opp_last_known_facing;
+            st.blue.visible = true;
+        }
+        enemy_visible = e.obs.opp_visible;
+
+        if (e.consumed) ++used;
+        // 免费转向资格的失效条件（对应引擎 Match::do_action）：
+        //   · 用掉一次 TURN  → 资格被消费
+        //   · 离开出生点     → 资格立即失效
+        //   在出生点做 FIRE/SCAN/MOVE 中的前两者不会使其失效
+        if (action == sim::kTurn) {
+            free_turn = false;
+        } else {
+            free_turn = free_turn && (st.red.last_known_pos.x == my_spawn.x &&
+                                      st.red.last_known_pos.y == my_spawn.y);
+        }
+        failures = 0;
+    }
+
+    // 保存跨回合记忆
+    g_mem.last_turn = board.turn;
+    g_mem.last_my_pos = st.red.last_known_pos;
+    g_mem.enemy_belief = st.blue.last_known_pos;
+    g_mem.enemy_belief_facing = st.blue.last_known_facing;
+    g_mem.enemy_belief_valid = true;
+}
+
+// 绝对安全的兜底：只做不会失败的事，且最多一步
+void fallback(const Board& board, char my_color) {
+    const Sentry& me = (my_color == 'R') ? board.red : board.blue;
+    const Sentry& opp = (my_color == 'R') ? board.blue : board.red;
+
+    if (opp.visible && me.fire_cd == 0) {
+        fire();
+        return;
+    }
+    if (me.scan_cd == 0) {
+        scan();
+        return;
+    }
+    const Pos* target = nullptr;
+    int best = 1 << 20;
+    for (const Pos& z : board.score_zones) {
+        const int d = std::abs(z.x - me.last_known_pos.x) +
+                      std::abs(z.y - me.last_known_pos.y);
+        if (d < best) {
+            best = d;
+            target = &z;
+        }
+    }
+    if (target == nullptr) return;
+    // 同样：turn() 要的是局部朝向，引擎自己处理蓝方镜像
+    const char want = sim::best_turn_to_face(me.last_known_pos, *target);
+    if (me.last_known_facing != want) {
+        turn(want);
+        return;
+    }
+    move();
+}
+
+} // namespace
+
+extern "C" void act(const Board& board, char my_color) {
+    try {
+        run(board, my_color);
+    } catch (...) {
+        // 崩溃 = 整局判负，所以这里必须吞掉一切异常
+        try {
+            fallback(board, my_color);
+        } catch (...) {
+        }
+    }
+}

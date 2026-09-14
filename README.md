@@ -10,10 +10,53 @@
 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
-| ⓪ | `sim/` 前向模型 + 差分测试 | **规则核心已完成**（match 层待补） |
-| ① | 简单搜索 + policy model | 未开始 |
+| ⓪ | `sim/` 前向模型 + 差分测试 | **规则核心已完成**（对局层待补） |
+| ① | 简单搜索 + policy model | **可跑可上传，但未达入围赛口径** |
 | ② | MCTS | 未开始 |
 | ③ | RNN + PPO | 未开始 |
+
+## 阶段① 现状（必读）
+
+已实现：`sim/` 前向模型 + 本回合搜索（我方 0-3 行动穷举 → 对手 0-3 行动
+minimax 回应 → 评估），执行层带时间预算、分叉重规划与兜底。
+
+**实测（各 400 局，红蓝各半）：**
+
+| 对手 | 胜 | 负 | 综合得分率 | 平均净胜分 |
+|---|---|---|---|---|
+| baseline | 210 | 190 | 0.525 | −4.38 |
+| hunter | 188 | 212 | **0.470** | −3.32 |
+
+入围赛要求对两者**胜场都严格大于对手**，所以**目前还不达标**。
+
+### 调参已到平台期，瓶颈是结构
+
+对 `w_danger / w_threat / w_dist` 做过网格扫描（`tools/sweep_pool.py`），
+按"对池中最差对手的得分率"取最优，最好也只到 **0.487**。继续调不会有用。
+
+过程中踩到并记录下来的两个坑：
+
+1. **只对单一对手调参会严重过拟合。** 找到一个配置对 baseline 是 **400 胜 0 负
+   (100%)**，对 hunter 却是 **17 胜 383 负 (4.3%)**。所以评测的目标函数必须是
+   "对池中每个对手的最小得分率"，不能是单一对手的平均值。
+2. **官方对手是随机的。** `baseline_ai.cpp:25` 与 `hunter_ai.cpp:25` 都用
+   `steady_clock::now()` 给 xorshift 播种，每次运行都不同——所以胜率是采样
+   估计，局数不够时不要相信两位小数。引擎与我们的 AI 本身都是确定性的
+   （`tests/test_invariants.py` 有断言）。
+
+### 下一刀应该切哪里
+
+搜索的敌方位置是**单点信念**（最后已知位置），而 hunter 每 3 回合扫描一次、
+从 3 格外开火。以下两件事按收益排序：
+
+1. **敌方位置用可达集信念而非单点**（rl 管线的 `obs_builder.h` 有现成做法）。
+   单点信念会让"危险"估计完全失真——对手从视野外接近时我们以为自己是安全的。
+2. **给 SCAN 定价。** 现在 SCAN 靠 `agent/act.cpp` 里的一条显式规则触发，因为
+   在单点信念下搜索**无法**给信息定价（模拟中扫描不改变敌方位置，于是它在评估
+   函数眼里是纯亏）。信念建模之后这条规则才能被真正的信息价值取代。
+
+阶段③ 的 RNN 能从历史维持信念，正是为了解决这一点 —— 但在那之前，
+阶段①/② 用显式的可达集也能拿到大部分收益。
 
 ## 为什么需要 `sim/`
 
@@ -72,15 +115,25 @@ make test-quick    # 抽样，CI / 快速回归
 
 这是下一步 `sim/` 的 match 层与 Part B 差分测试的工作。
 
-## 构建
+## 构建与评测
 
 ```bash
-make engine      # CMake out-of-source 构建引擎到 build/engine
-make opponents   # 从仓库源码编译 baseline / hunter 到 build/opponents
-make all         # 以上两者
+make engine           # CMake out-of-source 构建引擎到 build/engine
+make opponents        # 从仓库源码编译 baseline / hunter
+make opponents-det    # 编译引擎自带的确定性测试 AI（不变量测试用）
+make ai               # 构建我们的 build/my_ai.so
+make all              # 以上
+
+make test             # sim 与引擎规则核心的差分测试（约 790 万次比对）
+make test-quick       # 同上，抽样
+python3 tests/test_invariants.py   # 确定性与颜色对称回归测试
+
+python3 tools/league.py --a build/my_ai.so --b build/opponents/hunter_ai.so --games 400
+python3 tools/sweep_pool.py --games 150        # 对对手池扫描权重
+python3 tools/pack.py --verify                 # 打包并模拟平台编译
 ```
 
-依赖：`g++`（C++17）、`cmake`、`make`。
+依赖：`g++`（C++17）、`cmake`、`make`、`python3`（仅标准库）。
 
 若引擎源码位置不同，覆盖 `SENTRY_DUEL_ROOT`：
 
@@ -88,14 +141,23 @@ make all         # 以上两者
 make SENTRY_DUEL_ROOT=/path/to/sentry-duel all
 ```
 
+### 权重调参
+
+`Weights` 的编译期默认值写在 `brain/eval.h`。离线调参可用环境变量临时覆盖
+（平台评测时环境里没有这些变量，线上行为完全由默认值决定）：
+
+```bash
+ST_W_DANGER=0.5 ST_W_THREAT=1.5 python3 tools/league.py ...
+ST_BUDGET_MS=1000 ST_DEBUG=1 build/engine/runner ...   # 打印每步决策
+```
+
 ## 目录
 
 ```
 sim/         前向模型（纯函数，只依赖选手 ABI 头 sentry_duel.h）
-tests/       差分测试
-brain/       决策器：search/ mcts/ nn/          （待建）
-agent/       act() 入口：状态组装 → 决策 → 真机执行 → 分叉重规划 → 兜底
-obs/         观测/特征构建（训练与部署共用）
-tools/       评测与脚本
+brain/       决策器：eval.cpp 评估函数 + search.cpp 本回合搜索
+agent/       act() 入口：状态组装 → 搜索 → 真机执行 → 分叉重规划 → 兜底
+tests/       sim 差分测试 + AI 不变量回归测试
+tools/       评测（league / sweep / sweep_pool）、打包（pack）
 build/       全部产物（gitignore）
 ```

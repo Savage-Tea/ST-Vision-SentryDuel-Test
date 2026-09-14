@@ -1,0 +1,27 @@
+# 选手源码包 Makefile
+#
+# 平台执行 `make -C <项目根>`，并注入两个环境变量：
+#   ENGINE_INCLUDE  引擎头文件目录
+#   ENGINE_LIB_DIR  引擎库目录
+# 要求把 .so 产出到项目根目录。
+
+CXX            ?= g++
+ENGINE_INCLUDE ?= ../engine/include
+ENGINE_LIB_DIR ?= ../engine/build
+
+CXXFLAGS = -std=c++17 -O2 -fPIC -Wall -Wextra -I. -I$(ENGINE_INCLUDE)
+# move/turn/fire/scan 由 runner 进程在 dlopen 时提供，故必须 lazy + 允许未定义符号
+LDFLAGS  = -shared -Wl,-z,lazy -Wl,--allow-shlib-undefined \
+           -L$(ENGINE_LIB_DIR) -lsentry_duel_engine
+
+SRC = my_ai.cpp sim/rules.cpp brain/eval.cpp brain/search.cpp
+
+all: my_ai.so
+
+my_ai.so: $(SRC)
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) $(SRC) -o $@
+
+clean:
+	rm -f my_ai.so
+
+.PHONY: all clean

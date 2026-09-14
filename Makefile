@@ -14,9 +14,9 @@ CXXFLAGS := -std=c++17 -O2 -fPIC -Wall -Wextra -MMD -MP -I. -I$(ENGINE_INC)
 
 ENGINE_LINK := -L$(ENGINE_BUILD) -lsentry_duel_engine -Wl,-rpath,'$$ORIGIN/engine' -ldl
 
-.PHONY: all engine opponents test test-quick clean
+.PHONY: all engine opponents ai test test-quick clean
 
-all: engine opponents
+all: engine opponents ai
 
 # —— 引擎（CMake out-of-source：源码在仓库，产物在我们这里）——
 engine:
@@ -31,6 +31,25 @@ opponents: $(OPPONENTS)
 $(BUILD)/opponents/%.so: $(SENTRY_DUEL_ROOT)/ai/%.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -shared -Wl,-z,lazy -Wl,--allow-shlib-undefined $< -o $@
+
+# 引擎自带的确定性测试 AI —— 不变量回归测试的对手（官方 baseline/hunter 是随机的，
+# 断言没法严格）
+DET_OPPONENTS := $(BUILD)/opponents/det_ai_a.so $(BUILD)/opponents/det_ai_b.so
+
+opponents-det: $(DET_OPPONENTS)
+
+$(BUILD)/opponents/det_ai_%.so: $(SENTRY_DUEL_ROOT)/engine/tests/det_ai_%.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -shared -Wl,-z,lazy -Wl,--allow-shlib-undefined $< -o $@
+
+# —— 我们的 AI（阶段①：搜索 + policy model）——
+AI_SRC := agent/act.cpp brain/eval.cpp brain/search.cpp sim/rules.cpp
+
+$(BUILD)/my_ai.so: $(AI_SRC) | engine
+	$(CXX) $(CXXFLAGS) -shared -Wl,-z,lazy -Wl,--allow-shlib-undefined \
+	    $(AI_SRC) -o $@ $(ENGINE_LINK)
+
+ai: $(BUILD)/my_ai.so
 
 # —— 差分测试：sim 必须与引擎规则核心逐字段一致 ——
 $(BUILD)/difftest_rules: tests/difftest_rules.cpp sim/rules.cpp | engine
