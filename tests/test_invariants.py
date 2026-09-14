@@ -39,6 +39,7 @@ AI = ROOT / "build" / "my_ai.so"
 # 教训：曾经因为"两侧都赢、只是分差大"把这个阈值放宽到 25，结果漏掉了
 # 一次真实的颜色不对称回归（红 +34 / 蓝 -6）。两侧都赢 ≠ 对称。
 MAX_COLOR_GAP = 10.0
+MIN_MARGIN = 1  # 每一侧至少净胜这么多分
 
 failures: list[str] = []
 
