@@ -26,7 +26,7 @@ ENGINE_LINK := -L$(ENGINE_BUILD) -lsentry_duel_engine -Wl,-rpath,'$$ORIGIN/engin
 # 本项目编译只要几秒，宁可多编一次，也不要用旧二进制。
 HDRS := $(shell find . -name '*.h' -not -path './build/*' 2>/dev/null)
 
-.PHONY: all engine opponents ai test test-quick clean
+.PHONY: all engine opponents ai test test-quick clean selfplay-ppo test-policy test-view test-obs-v3
 
 all: engine opponents ai
 
@@ -136,3 +136,20 @@ $(BUILD)/selfplay: $(SELFPLAY_SRC) $(HDRS)
 	$(CXX) $(CXXFLAGS) $(SELFPLAY_SRC) -o $@ -pthread
 
 selfplay: $(BUILD)/selfplay
+
+# —— 阶段③ 策略自对弈（PPO 轨迹生成）——
+# 注意这里**不要** brain/mcts.cpp 与 brain/belief_state.cpp：
+# 阶段③ 的观测不含手工信念，动作也由策略网络直出，不经过搜索。
+# sim/belief.cpp 是被 brain/actions.cpp 的 collect_candidates 拖进来的（它收
+# 一个 Belief* 参数），虽然阶段③ 的观测不含手工信念、驱动也不调那个函数。
+# 这里要的是 apply_step —— 它已经把额度与免费转向语义复刻好了，重写一遍不划算。
+SELFPLAY_PPO_SRC := selfplay/selfplay_ppo.cpp brain/policy_net.cpp \
+                    brain/actions.cpp brain/eval.cpp \
+                    obs/encode_v3.cpp sim/view_mirror.cpp \
+                    sim/rules.cpp sim/belief.cpp
+
+$(BUILD)/selfplay_ppo: $(SELFPLAY_PPO_SRC) $(HDRS)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $(SELFPLAY_PPO_SRC) -o $@ -pthread
+
+selfplay-ppo: $(BUILD)/selfplay_ppo
