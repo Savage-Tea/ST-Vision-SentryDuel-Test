@@ -1,0 +1,6 @@
+# 让 clangd 找到引擎的选手 ABI 头（只读引用 ../sentry-duel）
+CompileFlags:
+  Add:
+    - -std=c++17
+    - -I.
+    - -I../sentry-duel/engine/include
