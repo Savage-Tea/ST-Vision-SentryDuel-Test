@@ -26,7 +26,7 @@ void encode(const sim::State& s, const sim::Belief& belief, bool enemy_visible,
     for (const Pos& z : s.score_zones) set_plane(out, 1, z.x, z.y);
 
     // —— 平面 2：我方位置 ——
-    if (Belief::in_bounds(me.last_known_pos)) {
+    if (sim::Belief::in_bounds(me.last_known_pos)) {
         set_plane(out, 2, me.last_known_pos.x, me.last_known_pos.y);
     }
 
@@ -38,12 +38,12 @@ void encode(const sim::State& s, const sim::Belief& belief, bool enemy_visible,
     }
 
     // —— 平面 4：敌方当前直接可见位置 ——
-    if (enemy_visible && Belief::in_bounds(opp.last_known_pos)) {
+    if (enemy_visible && sim::Belief::in_bounds(opp.last_known_pos)) {
         set_plane(out, 4, opp.last_known_pos.x, opp.last_known_pos.y);
     }
 
     // —— 平面 5：敌方最后已知位置（锚点） ——
-    if (Belief::in_bounds(opp.last_known_pos)) {
+    if (sim::Belief::in_bounds(opp.last_known_pos)) {
         set_plane(out, 5, opp.last_known_pos.x, opp.last_known_pos.y);
     }
 

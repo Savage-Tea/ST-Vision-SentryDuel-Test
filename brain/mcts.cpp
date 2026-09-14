@@ -1,5 +1,8 @@
 #include "brain/mcts.h"
 
+#include "brain/net.h"
+#include "obs/encode.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -68,7 +71,7 @@ public:
         result.root_value = nodes_[root].total_visits > 0
                                 ? nodes_[root].total_value / nodes_[root].total_visits
                                 : 0.0;
-        result.plan = pick_plan(root);
+        result.plan = pick_plan(root, result.pi);
         return result;
     }
 
@@ -154,30 +157,55 @@ private:
                            &n.belief, n.cands);
         n.cands.push_back({kStop, 0});
 
-        std::vector<double> raw;
-        raw.reserve(n.cands.size());
+        std::vector<double> child_value;
+        child_value.reserve(n.cands.size());
         for (const Cand& c : n.cands) {
             const int ci = make_child(idx, c);
             n.child.push_back(ci);
-            // 先验用"这一步之后、从本节点走子方看有多好"——等价于一步前瞻的评估
-            raw.push_back(ci >= 0 ? evaluate_for(nodes_[ci].state, w_, nodes_[ci].belief,
-                                                 n.to_move)
-                                  : -kWinValue);
+            child_value.push_back(ci >= 0 ? evaluate_for(nodes_[ci].state, w_,
+                                                         nodes_[ci].belief, n.to_move)
+                                          : -kWinValue);
         }
 
-        // softmax 成先验
-        const double vmax = *std::max_element(raw.begin(), raw.end());
-        double sum = 0.0;
-        n.prior.assign(raw.size(), 0.0);
-        for (size_t i = 0; i < raw.size(); ++i) {
-            n.prior[i] = std::exp((raw[i] - vmax) / cfg_.prior_temperature);
-            sum += n.prior[i];
+        // —— 先验 ——
+        // 根节点优先用训练出来的策略网络（若已导出权重）；否则退回一步估值的
+        // softmax。只在根节点用网络，因为树里对手节点的观测需要"对手的信念"，
+        // 而我们没有——那部分继续用评估函数（evaluate_for 对任意一方都有定义）。
+        n.prior.assign(n.cands.size(), 0.0);
+        bool have_net_prior = false;
+        if (idx == 0 && net_available()) {
+            float obsbuf[obs::kObsDim];
+            obs::encode(n.state, n.belief, root_enemy_visible_, n.used, n.free_turn,
+                        obsbuf);
+            float net_prior[kActionDim] = {0};
+            float net_value = 0.0f;
+            if (net_prior_value(obsbuf, net_prior, &net_value)) {
+                double s = 0.0;
+                for (size_t i = 0; i < n.cands.size(); ++i) {
+                    const int ai = cand_to_index(n.cands[i]);
+                    n.prior[i] = (ai >= 0) ? net_prior[ai] : 0.0;
+                    s += n.prior[i];
+                }
+                if (s > 1e-8) {
+                    for (double& p : n.prior) p /= s;
+                    have_net_prior = true;
+                }
+            }
         }
-        if (sum > 0.0) {
-            for (double& p : n.prior) p /= sum;
-        } else {
-            const double u = 1.0 / static_cast<double>(n.prior.size());
-            for (double& p : n.prior) p = u;
+
+        if (!have_net_prior) {
+            const double vmax = *std::max_element(child_value.begin(), child_value.end());
+            double sum = 0.0;
+            for (size_t i = 0; i < child_value.size(); ++i) {
+                n.prior[i] = std::exp((child_value[i] - vmax) / cfg_.prior_temperature);
+                sum += n.prior[i];
+            }
+            if (sum > 0.0) {
+                for (double& p : n.prior) p /= sum;
+            } else {
+                const double u = 1.0 / static_cast<double>(n.prior.size());
+                for (double& p : n.prior) p = u;
+            }
         }
 
         n.value_sum.assign(n.cands.size(), 0.0);
@@ -251,10 +279,24 @@ private:
         return v;
     }
 
-    Plan pick_plan(int root) {
+    Plan pick_plan(int root, float* pi_out) {
         const Node& n = nodes_[root];
         Plan plan;
         if (n.child.empty()) return plan;
+
+        // 训练目标 π：根节点各子节点的访问次数，压到固定动作空间后归一化
+        double total = 0.0;
+        for (size_t i = 0; i < n.child.size(); ++i) {
+            const int idx = cand_to_index(n.cands[i]);
+            if (idx < 0 || idx >= kActionDim) continue;
+            pi_out[idx] += static_cast<float>(n.visits[i]);
+            total += static_cast<double>(n.visits[i]);
+        }
+        if (total > 0.0) {
+            for (int i = 0; i < kActionDim; ++i) {
+                pi_out[i] = static_cast<float>(pi_out[i] / total);
+            }
+        }
 
         int best = 0;
         if (cfg_.sample_temperature > 0.0) {

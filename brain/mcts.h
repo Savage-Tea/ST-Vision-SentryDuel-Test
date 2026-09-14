@@ -45,6 +45,9 @@ struct MctsResult {
     double root_value = 0.0;   // 根值（我方视角）
     long long nodes = 0;
     bool time_exhausted = false;
+    // 根节点的访问次数分布，映射到固定动作空间（brain::kActionDim）。
+    // 这是自对弈训练的策略目标 π —— AlphaZero 配方的核心产物。
+    float pi[kActionDim] = {0};
 };
 
 MctsResult mcts_search(const TurnInput& in, const Weights& w, const MctsConfig& cfg,

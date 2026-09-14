@@ -25,3 +25,6 @@ checkpoints/
 .DS_Store
 *.swp
 *.swo
+
+# 训练产出的权重（由 tools/train_mlp.py 生成）
+brain/net_weights.h

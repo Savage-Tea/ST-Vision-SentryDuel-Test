@@ -44,7 +44,7 @@ $(BUILD)/opponents/det_ai_%.so: $(SENTRY_DUEL_ROOT)/engine/tests/det_ai_%.cpp
 
 # —— 我们的 AI（阶段①：搜索 + policy model）——
 AI_SRC := agent/act.cpp brain/eval.cpp brain/actions.cpp brain/search.cpp \
-          brain/mcts.cpp sim/rules.cpp sim/belief.cpp
+          brain/mcts.cpp brain/belief_state.cpp brain/net.cpp sim/rules.cpp sim/belief.cpp
 
 $(BUILD)/my_ai.so: $(AI_SRC) | engine
 	$(CXX) $(CXXFLAGS) -shared -Wl,-z,lazy -Wl,--allow-shlib-undefined \
@@ -84,3 +84,13 @@ clean:
 	rm -rf $(BUILD)
 
 -include $(shell find $(BUILD) -name '*.d' 2>/dev/null)
+
+# —— 自对弈样本生成器（纯 sim，不依赖引擎）——
+SELFPLAY_SRC := selfplay/selfplay.cpp brain/eval.cpp brain/actions.cpp \
+                brain/search.cpp brain/mcts.cpp brain/belief_state.cpp \
+                obs/encode.cpp brain/net.cpp sim/rules.cpp sim/belief.cpp
+
+$(BUILD)/selfplay: $(SELFPLAY_SRC)
+	$(CXX) $(CXXFLAGS) $(SELFPLAY_SRC) -o $@ -pthread
+
+selfplay: $(BUILD)/selfplay

@@ -11,6 +11,7 @@
 //
 // 时间预算是硬约束：引擎给 1 秒，超时 = 本回合剩余行动作废 + 送对手 1 分。
 
+#include "brain/belief_state.h"
 #include "brain/eval.h"
 #include "brain/mcts.h"
 #include "brain/search.h"
@@ -88,15 +89,9 @@ brain::Weights g_weights = load_weights();
 struct Memory {
     int last_turn = -1;
     Pos last_my_pos{-1, -1};
-    // 敌方可能位置集合（可达集信念）
-    sim::Belief belief;
-    // 信念的锚点：最后已知位置；也是给搜索用的"代表位置"
-    Pos enemy_anchor{-1, -1};
-    char enemy_facing = '?';
-    bool enemy_known = false;
-    // 信念是否是"确定"的（由实际观测塌缩而来），还是"假设"的（例如开局假设
-    // 对手在出生点）。决定要不要开雷达：假设 ≠ 知情。
-    bool belief_certain = false;
+    // 敌方位置信念。实现在 brain/SideBelief，与自对弈侧共用一份——
+    // 信念是观测的一部分，两份实现漂移会让训练输入与部署输入不一致。
+    brain::SideBelief belief;
 };
 Memory g_mem;
 
@@ -118,35 +113,12 @@ sim::State local_state(const Board& b, char side) {
 // 引擎的情报只在"看得见"时更新；而我们击杀对手后能推算出他回了出生点。
 // 所以我们的锚点往往比引擎的情报更准，只在从未得知时才用出生点兜底。
 void apply_belief(sim::State& st) {
-    if (!g_mem.enemy_known && st.blue.last_known_pos.x >= 0) {
-        g_mem.enemy_anchor = st.blue.last_known_pos;
-        g_mem.enemy_facing = st.blue.last_known_facing;
-        g_mem.enemy_known = true;
-        g_mem.belief.reset_to(g_mem.enemy_anchor);
-    }
-    if (!g_mem.enemy_known) {
-        // 从未得知：开局时对手确实在其出生点（局部坐标 (6,6)）
-        g_mem.enemy_anchor = sim::spawn_of('B', st.size);
-        g_mem.enemy_facing = sim::spawn_facing('B');
-        g_mem.enemy_known = true;
-        g_mem.belief.reset_to(g_mem.enemy_anchor);
-    }
-    // 搜索里用一个"代表位置"来推演：取锚点（最后已知），
-    // 不确定性则由评估函数对信念取期望来体现，两者分工不同。
-    st.blue.last_known_pos = g_mem.enemy_anchor;
-    st.blue.last_known_facing = g_mem.enemy_facing;
+    // 搜索里用一个"代表位置"来推演：取锚点（最后已知）。
+    // 不确定性由评估函数对信念取期望来体现，两者分工不同。
+    g_mem.belief.write_anchor_into(st);
     // 对手的 CD 引擎不暴露（恒为 -1），搜索里按保守值处理
     st.blue.fire_cd = brain::kAssumedEnemyFireCd;
     st.blue.scan_cd = 0;
-}
-
-// 塌缩信念到某个确定的格子（看见了 / 扫到了 / 推出位置了）
-void collapse_belief(const Pos& p, char facing) {
-    g_mem.belief.reset_to(p);
-    g_mem.enemy_anchor = p;
-    if (facing != 0) g_mem.enemy_facing = facing;
-    g_mem.enemy_known = true;
-    g_mem.belief_certain = true;
 }
 
 bool same_my_state(const Sentry& predicted, const ActionObservation& obs) {
@@ -206,32 +178,8 @@ void run(const Board& board, char my_color) {
         (g_mem.last_my_pos.x == my_spawn.x && g_mem.last_my_pos.y == my_spawn.y);
     bool free_turn = (board.turn == 0) || (at_spawn && !was_at_spawn);
 
-    // —— 敌方可能位置集合的维护 ——
-    // 引擎给的敌方位置：可见时是实时值，不可见时是过期情报
-    const Pos opp_reported = st.blue.last_known_pos;
-    const char opp_reported_facing = st.blue.last_known_facing;
-
-    // ① 扩张：敌方自上次我方行动后走完了一个行动阶段（最多 3 格）
-    if (board.turn != 0 && g_mem.enemy_known) {
-        sim::dilate(g_mem.belief, brain::kMaxActions, st.red.last_known_pos, st.obstacles);
-        // 扩张之后位置不再确定 —— 这正是该开雷达的时刻
-        g_mem.belief_certain = false;
-    }
-    // ② 塌缩：看得见 → 精确位置；否则若还没有任何情报，用引擎给的兜底
-    if (enemy_visible && opp_reported.x >= 0) {
-        collapse_belief(opp_reported, opp_reported_facing);
-    } else if (!g_mem.enemy_known && opp_reported.x >= 0) {
-        collapse_belief(opp_reported, opp_reported_facing);
-    }
-    // ③ 从未得知 → 敌方出生点（局部坐标 (6,6)）
-    if (!g_mem.enemy_known) {
-        collapse_belief(sim::spawn_of('B', st.size), sim::spawn_facing('B'));
-    }
-    // ④ 证伪：当前 T 形视野内确认无人的格子剔除
-    sim::prune_by_vision(g_mem.belief, st.red, st.obstacles);
-    sim::prune_impossible(g_mem.belief, st.red.last_known_pos, st.obstacles);
-    if (g_mem.belief.empty()) g_mem.belief.reset_to(g_mem.enemy_anchor);
-
+    // —— 敌方位置信念的维护（与自对弈侧共用 brain/SideBelief）——
+    g_mem.belief.begin_turn(st, board.turn, enemy_visible);
     apply_belief(st);
 
     brain::TurnInput in;
@@ -246,7 +194,7 @@ void run(const Board& board, char my_color) {
     // 阶段③ 的 RNN 能从历史维持信念，届时这条规则会被真正的信息价值取代。
     // 只有在"位置不再确定"时才值得开雷达。开局时信念是一个格子，但那是
     // **假设**（对手在出生点）而不是知情，所以同样要扫。
-    if (!enemy_visible && st.red.scan_cd == 0 && !g_mem.belief_certain) {
+    if (!enemy_visible && st.red.scan_cd == 0 && !g_mem.belief.certain) {
         const Executed e = execute(sim::kScan, 0);
         if (e.success) {
             if (e.consumed) ++used;
@@ -256,14 +204,15 @@ void run(const Board& board, char my_color) {
                 st.blue.last_known_facing = e.obs.opp_last_known_facing;
                 st.blue.visible = true;
                 enemy_visible = true;
-                collapse_belief(e.obs.opp_last_known_pos, e.obs.opp_last_known_facing);
+                g_mem.belief.collapse(e.obs.opp_last_known_pos,
+                                      e.obs.opp_last_known_facing);
             }
         }
     }
 
     while (used < brain::kMaxActions && Clock::now() < deadline) {
         in.state = st;
-        in.belief = g_mem.belief;
+        in.belief = g_mem.belief.set;
         in.used_by_now = used;
         in.free_turn_available = free_turn;
         in.enemy_visible = enemy_visible;
@@ -298,7 +247,7 @@ void run(const Board& board, char my_color) {
                          static_cast<int>(free_turn), st.red.last_known_pos.x,
                          st.red.last_known_pos.y, st.red.last_known_facing,
                          st.blue.last_known_pos.x, st.blue.last_known_pos.y,
-                         st.blue.last_known_facing, g_mem.belief.count(),
+                         st.blue.last_known_facing, g_mem.belief.set.count(),
                          stats.our_nodes, stats.opp_nodes,
                          stats.refined, static_cast<int>(stats.time_exhausted), plan.value,
                          plan.count,
@@ -332,9 +281,10 @@ void run(const Board& board, char my_color) {
                 int dx = 0;
                 int dy = 0;
                 sim::facing_delta(st.red.last_known_facing, dx, dy);
-                collapse_belief({st.red.last_known_pos.x + dx,
-                                 st.red.last_known_pos.y + dy},
-                                '?'); // 位置确定，朝向仍未知
+                // 目标格被对手占着 —— 位置确定，朝向仍未知
+                g_mem.belief.infer_at({st.red.last_known_pos.x + dx,
+                                       st.red.last_known_pos.y + dy});
+                g_mem.belief.anchor_facing = '?';
                 apply_belief(st);
             }
             if (failures >= kMaxFailedAttempts) break;
@@ -353,15 +303,14 @@ void run(const Board& board, char my_color) {
 
         // 命中 → 对手回出生点。这是瞬移，不属于"3 格内的移动"，必须直接重置信念。
         if (planned.hit) {
-            collapse_belief(sim::spawn_of('B', st.size), sim::spawn_facing('B'));
+            g_mem.belief.on_our_hit(st.size);
         }
         if (e.obs.opp_visible) {
-            collapse_belief(e.obs.opp_last_known_pos, e.obs.opp_last_known_facing);
+            g_mem.belief.collapse(e.obs.opp_last_known_pos,
+                                  e.obs.opp_last_known_facing);
         }
         // 我方这一步后视野变了 → 用新视野证伪
-        sim::prune_by_vision(g_mem.belief, st.red, st.obstacles);
-        sim::prune_impossible(g_mem.belief, st.red.last_known_pos, st.obstacles);
-        if (g_mem.belief.empty()) g_mem.belief.reset_to(g_mem.enemy_anchor);
+        g_mem.belief.after_action(st);
         apply_belief(st);
         st.blue.visible = e.obs.opp_visible;
         enemy_visible = e.obs.opp_visible;
