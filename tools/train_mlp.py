@@ -63,14 +63,25 @@ def load_samples(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     n = len(body) // sz
     if n == 0:
         sys.exit("样本为空")
-    arr = (Sample * n).from_buffer_copy(body[: n * sz])
 
-    obs = np.frombuffer(
-        b"".join(bytes(a.obs) for a in arr), dtype=np.float32
-    ).reshape(n, obs_dim) if False else np.array([list(a.obs) for a in arr], dtype=np.float32)
-    pi = np.array([list(a.pi) for a in arr], dtype=np.float32)
-    z = np.array([a.z for a in arr], dtype=np.float32)
-    return obs, pi, z
+    # 把整段字节直接"看成"结构化数组，按字段取零拷贝视图。
+    #
+    # 不要写成 np.array([list(a.obs) for a in arr])：那会为每条样本建一个
+    # 410 元素的 Python list（70 万条 ≈ 3 亿个 float 对象），实测慢 240 倍。
+    # 字段偏移从 ctypes 的 Sample 上取，C++ 那边改了结构体会在下面的
+    # itemsize 断言里立刻暴露，而不是静默读歪。
+    dtype = np.dtype({
+        "names": ["obs", "pi", "z"],
+        "formats": [(np.float32, obs_dim), (np.float32, act_dim), np.float32],
+        "offsets": [Sample.obs.offset, Sample.pi.offset, Sample.z.offset],
+        "itemsize": sz,
+    })
+    if dtype.itemsize != sz:
+        sys.exit(f"样本记录布局与 C++ 不一致: {dtype.itemsize} != {sz}")
+
+    arr = np.frombuffer(body, dtype=dtype, count=n)
+    # frombuffer 给出的是只读视图，而 torch.from_numpy 要求可写，故各拷一份
+    return arr["obs"].copy(), arr["pi"].copy(), arr["z"].copy()
 
 
 class Net(nn.Module):
@@ -159,7 +170,8 @@ def main() -> int:
     ap.add_argument("--vf-coef", type=float, default=0.5)
     ap.add_argument("--out", default="build/net.npz")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--threads", type=int, default=0, help="0 = 用满 CPU")
+    ap.add_argument("--threads", type=int, default=8,
+                    help="torch 内部线程数；0 = 用满所有核（默认 8，见下方注释）")
     ap.add_argument("--export-only", action="store_true",
                     help="不训练，直接从 --out 的检查点导出权重头文件")
     args = ap.parse_args()
@@ -177,6 +189,17 @@ def main() -> int:
     if not args.data:
         sys.exit("训练需要 --data（或用 --export-only 只导出）")
 
+    # 默认**不用满所有核**。这个网络只有 17 万参数、batch 1024，每步约 0.5 GFLOP，
+    # 属于延迟受限负载：线程一多，同步开销会盖过计算本身。
+    #
+    # cluster48（192 核）上实测同样 30 步，**机器同时还在跑自对弈**：
+    #   threads=192 → 385 ms/步   threads=32 → 410   threads=8 → 312   threads=1 → 71
+    # 即核越多越慢，1 线程反而快 5.4 倍。这是过载（oversubscription）的典型形态：
+    # 192 个 OpenMP 线程自旋等待，和同机其他负载互相抢核。
+    #
+    # 另外观察到同一套管线两轮训练耗时差约 10 倍（一轮约 6 分钟、另一轮 52 分钟），
+    # 原因未查清，但线程过载是唯一已定位的放大器，所以这里先取保守值。
+    # 该值不追求最优，只求不滚雪球；0 仍表示"用满所有核"，需要时显式传。
     if args.threads > 0:
         torch.set_num_threads(args.threads)
     torch.manual_seed(args.seed)
