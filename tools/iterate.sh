@@ -32,21 +32,41 @@ for r in $(seq 1 "$ROUNDS"); do
     echo "存档 build/rounds/my_ai_r$r.so"
 done
 
+# 评测失败必须炸出来。
+#
+# 这里原来是 `... | grep -E "胜 |综合得分率" || true`，于是**两类失败同时被吞**：
+#   · league.py 自己报错（例如 .so 加载不了）
+#   · league.py 正常退出但没有产出结果行
+# 实测后果：三轮迭代跑完、.so 全部存档，最后评测段每一个标题下面都是空的，
+# 而整个脚本以退出码 0 结束。花掉几小时集群时间，换来零个强度数字。
+# 评测是这条路线上唯一的验收环节，它沉默就等于整轮白跑。
+eval_league() {
+    local a=$1 b=$2 label=$3 out
+    if ! out=$(ST_MCTS=1 python3 tools/league.py --a "$a" --b "$b" \
+               --games "${EVAL_GAMES:-200}" --jobs "$THREADS" 2>&1); then
+        echo "$out" | tail -15
+        echo "❌ 评测失败: $label"
+        return 1
+    fi
+    if ! echo "$out" | grep -E "胜 |综合得分率"; then
+        echo "$out" | tail -15
+        echo "❌ 评测没有产出结果行: $label"
+        return 1
+    fi
+}
+
 echo
 echo "################ 回合间对比（带 ST_MCTS=1）################"
 for r in $(seq 2 "$ROUNDS"); do
     prev=$((r - 1))
     echo "--- r$r vs r$prev ---"
-    ST_MCTS=1 python3 tools/league.py --a "build/rounds/my_ai_r$r.so" \
-        --b "build/rounds/my_ai_r$prev.so" --games 200 --jobs "$THREADS" \
-        2>&1 | grep -E "胜 |综合得分率" || true
+    eval_league "build/rounds/my_ai_r$r.so" "build/rounds/my_ai_r$prev.so" "r$r vs r$prev"
 done
 
 echo
 echo "################ 对官方对手（带 ST_MCTS=1）################"
 for opp in baseline hunter; do
     echo "--- r$ROUNDS vs $opp ---"
-    ST_MCTS=1 python3 tools/league.py --a "build/rounds/my_ai_r$ROUNDS.so" \
-        --b "build/opponents/${opp}_ai.so" --games 200 --jobs "$THREADS" \
-        2>&1 | grep -E "胜 |综合得分率" || true
+    eval_league "build/rounds/my_ai_r$ROUNDS.so" "build/opponents/${opp}_ai.so" \
+        "r$ROUNDS vs $opp"
 done
