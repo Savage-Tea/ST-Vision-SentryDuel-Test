@@ -63,9 +63,39 @@ constexpr uint32_t kVersion = 1;
 
 // 击杀得分。与引擎 board.cpp 的 `me.score += 2` 一致。
 constexpr float kKillReward = 2.0f;
-// 终局胜负加成。可调——它和 Δ 分差的方向一致（分高者胜），
-// 所以不存在"刷分但输掉比赛"的冲突，这个权重只是给"赢"多一点强调。
-constexpr float kTerminalReward = 1.0f;
+// 终局胜负加成。从 1.0 提到 3.0：让"赢"相对塑形项更有分量，
+// 避免策略只学会走位不学会赢。
+constexpr float kTerminalReward = 3.0f;
+
+// ── 基于势能的奖励塑形 ──
+//
+// F(s,s') = γ·Φ(s') − Φ(s)，其中 Φ = −w·(到最近得分区的曼哈顿距离)。
+//
+// **必须写成这个形式。** 任意加塑形项会改变最优策略（比如"靠近得分区就加分"
+// 会让最优解变成贴着得分区蹭而不进去）。基于势能的塑形是唯一有理论保证
+// 不改变最优策略的加法（Ng/Harada/Russell 1999）。
+//
+// 为什么需要它：未训练策略几乎不得分（83% 的局是 0-0），原始奖励只有 0.6%
+// 的步非零，"什么都不做"和"到处乱走"得分完全一样，策略没有任何理由动起来。
+// Φ 给出"往中心走"的梯度，而停在原地得 0、来回走正负抵消——不会奖励蹭边。
+//
+// γ 必须与训练侧的折扣一致（tools/train_ppo.py 的 --gamma 默认 0.99），
+// 否则不变性不成立。
+constexpr float kShapeW = 0.05f;
+constexpr float kGamma = 0.99f;
+
+// 势能：到最近得分区的距离的负数
+float potential(const sim::State& w, char side) {
+    const Sentry& me = w.sentry_for(side);
+    int best = 1 << 20;
+    for (const Pos& z : w.score_zones) {
+        const int d = std::abs(z.x - me.last_known_pos.x) +
+                      std::abs(z.y - me.last_known_pos.y);
+        if (d < best) best = d;
+    }
+    if (best >= (1 << 20)) return 0.0f;
+    return -kShapeW * static_cast<float>(best);
+}
 
 struct Step {
     float obs[obs::kObsDimV3];
@@ -157,6 +187,7 @@ void play_game(unsigned seed, SideTraj& traj_r, SideTraj& traj_b) {
 
                 if (a == brain::kActionDim - 1) break; // 收手，结束本阶段
 
+                const float phi_before = potential(world, side);
                 const brain::Cand world_c =
                     brain::local_to_world(brain::index_to_cand(a), side);
                 bool hit = false;
@@ -165,6 +196,8 @@ void play_game(unsigned seed, SideTraj& traj_r, SideTraj& traj_b) {
                     // 但我们不能就此中止——继续本阶段剩下的额度，让它从后果里学。
                     continue;
                 }
+                // 势能塑形：γ·Φ(s') − Φ(s)。加在**行动后的那一步**上。
+                t.steps.back().reward += kGamma * potential(world, side) - phi_before;
                 if (hit) {
                     // 击杀：即时奖励记在**开火那一步**（引擎在这里 +2 分）
                     t.steps.back().reward += kKillReward;

@@ -118,7 +118,9 @@ def main() -> int:
     ap.add_argument("--lam", type=float, default=0.95)
     ap.add_argument("--clip", type=float, default=0.2)
     ap.add_argument("--vf-coef", type=float, default=0.5)
-    ap.add_argument("--ent-coef", type=float, default=0.01)
+    ap.add_argument("--ent-coef", type=float, default=0.05,
+                    help="熵系数。这是**真正管探索**的旋钮：0.01 时策略
+                          长期钉在 ln(8) 附近不动；调到 0.05 鼓励动作多样性")
     ap.add_argument("--out", default="build/policy.npz")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--threads", type=int, default=8)
