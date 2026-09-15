@@ -18,7 +18,8 @@ struct Leaf {
 // 我方第一层：枚举 0..3 个行动，每个深度都作为候选方案记录下来
 void dfs_our(const sim::State& s, const sim::Belief& b, int used, bool free_turn,
              bool enemy_visible, int depth, Plan& cur, std::vector<Leaf>& out,
-             const Deadline& dl, SearchStats& st, const Weights& w, const TurnInput* bans) {
+             const Deadline& dl, SearchStats& st, const Weights& w, bool acts_first,
+             const TurnInput* bans) {
     {
         // 我方行动阶段结束 → 本回合占点分入账
         sim::State after = s;
@@ -27,7 +28,7 @@ void dfs_our(const sim::State& s, const sim::Belief& b, int used, bool free_turn
         leaf.plan = cur;
         leaf.plan.count = depth;
         // 行动是有限资源：同等局面下优先选消耗更少的方案（仅用于打破平局）
-        leaf.value = evaluate(after, w, b) - w.w_waste * static_cast<double>(used);
+        leaf.value = evaluate(after, w, b, acts_first) - w.w_waste * static_cast<double>(used);
         leaf.state = after;
         leaf.belief = b;
         leaf.plan.valid = true;
@@ -59,18 +60,19 @@ void dfs_our(const sim::State& s, const sim::Belief& b, int used, bool free_turn
 
         cur.actions[depth] = c.action;
         cur.args[depth] = c.arg;
-        dfs_our(ns, nb, nused, nfree, enemy_visible, depth + 1, cur, out, dl, st, w, bans);
+        dfs_our(ns, nb, nused, nfree, enemy_visible, depth + 1, cur, out, dl, st, w,
+                acts_first, bans);
     }
 }
 
 // 对手第二层：枚举 0..3 个行动，取让我们最不利的（minimize）
 void dfs_opp(const sim::State& s, const sim::Belief& b, int used, bool free_turn,
              bool sees_us, int depth, double& worst, const Deadline& dl,
-             SearchStats& st, const Weights& w) {
+             SearchStats& st, const Weights& w, bool acts_first) {
     {
         sim::State after = s;
         sim::end_side_turn(after, 'B');
-        worst = std::min(worst, evaluate(after, w, b));
+        worst = std::min(worst, evaluate(after, w, b, acts_first));
         ++st.opp_nodes;
     }
 
@@ -87,24 +89,29 @@ void dfs_opp(const sim::State& s, const sim::Belief& b, int used, bool free_turn
         int nused = used;
         bool nfree = free_turn;
         if (!apply_step(ns, 'B', c, nused, nfree)) continue;
-        dfs_opp(ns, b, nused, nfree, sees_us, depth + 1, worst, dl, st, w);
+        dfs_opp(ns, b, nused, nfree, sees_us, depth + 1, worst, dl, st, w, acts_first);
     }
 }
 
 // 对手在我方叶子状态上的最优回应值
 double opponent_best(const sim::State& s, const sim::Belief& b, const Weights& w,
-                     const Deadline& dl, SearchStats& st) {
+                     bool acts_first, int opp_def_until, const Deadline& dl,
+                     SearchStats& st) {
     sim::State base = s;
-    // 对手的 CD 在观测里恒为 -1（引擎不暴露），保守假设其随时可开火
-    base.blue.fire_cd = kAssumedEnemyFireCd;
+    // 对手的 CD 在观测里恒为 -1（引擎不暴露），保守假设其随时可开火；
+    // 唯一例外是被击中推断出的无力窗口——那是对手刚开火的确定性情报，
+    // 窗口内保持状态里的 CD（=2，无法开火），让搜索敢压近。
+    if (!(base.turn <= opp_def_until)) {
+        base.blue.fire_cd = kAssumedEnemyFireCd;
+    }
     base.blue.scan_cd = 0;
 
     // 对手能否看见我们：这是确定可算的，决定了他能否开火
     const bool opp_sees_us = sim::can_see(base.blue, base.red.last_known_pos, base.obstacles);
 
-    double worst = evaluate(base, w, b);
+    double worst = evaluate(base, w, b, acts_first);
     const bool free_turn = sim::is_at_spawn(base, 'B');
-    dfs_opp(base, b, 0, free_turn, opp_sees_us, 0, worst, dl, st, w);
+    dfs_opp(base, b, 0, free_turn, opp_sees_us, 0, worst, dl, st, w, acts_first);
     return worst;
 }
 
@@ -116,7 +123,7 @@ Plan search_turn(const TurnInput& in, const Weights& w, const Deadline& deadline
     std::vector<Leaf> leaves;
     Plan cur;
     dfs_our(in.state, in.belief, in.used_by_now, in.free_turn_available, in.enemy_visible,
-            0, cur, leaves, deadline, st, w, &in);
+            0, cur, leaves, deadline, st, w, in.acts_first_world, &in);
 
     if (leaves.empty()) {
         if (stats) *stats = st;
@@ -136,7 +143,8 @@ Plan search_turn(const TurnInput& in, const Weights& w, const Deadline& deadline
             break;
         }
         leaves[i].value =
-            opponent_best(leaves[i].state, leaves[i].belief, w, deadline, st);
+            opponent_best(leaves[i].state, leaves[i].belief, w, in.acts_first_world,
+                          in.opp_defenseless_until, deadline, st);
         ++refined;
     }
     st.refined = refined;

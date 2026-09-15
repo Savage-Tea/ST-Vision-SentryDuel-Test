@@ -78,7 +78,8 @@ ThreatStats threat_stats(const sim::State& s, const sim::Belief& belief) {
     return stats;
 }
 
-double evaluate(const sim::State& s, const Weights& w, const sim::Belief& belief) {
+double evaluate(const sim::State& s, const Weights& w, const sim::Belief& belief,
+                bool acts_first_world) {
     // 局部框架下：red = 我方，blue = 对手
     const Sentry& me = s.red;
     const Sentry& opp = s.blue;
@@ -104,22 +105,36 @@ double evaluate(const sim::State& s, const Weights& w, const sim::Belief& belief
     const ThreatStats ts = threat_stats(s, belief);
     v += w.w_threat * ts.threat_prob;
     if (ts.threat_prob > 0.0 && me.fire_cd == 0) v += w.w_ready * ts.threat_prob;
-    // 确定的威胁给全权重；由信念推测出来的威胁打折，否则会瘫痪
-    v -= w.w_danger * ts.danger_known;
-    v -= w.w_danger * w.w_uncertain * ts.danger_unknown;
+    // 确定的威胁给全权重；由信念推测出来的威胁打折，否则会瘫痪。
+    //
+    // 【CD 时序不对称】打不了还手（fire_cd>0）时，"被击杀/被压制的暴露期"
+    // 红蓝不等：红方要熬 2 个对手惩罚窗口，蓝方只 1 个。同一格危险，
+    // 对先手方更致命——这正是 #14 观察到的"对峙时红开火必胜"的机制面。
+    // 让搜索看到这一点后，它应当自己学出：红方开火更谨慎（打空代价翻倍），
+    // 蓝方更敢开火、且对峙时主动破势而非硬顶。
+    const double exposure = (s.red.fire_cd > 0 && acts_first_world)
+                                ? w.w_danger_red_scale
+                                : 1.0;
+    // 对手 CD 未恢复时他无法开火——树里已经禁止他开火，叶子上的危险是
+    // "他恢复后的下一发"，给一半权重而不是全额（全额会让无力窗口形同虚设）。
+    const double opp_ready = (s.blue.fire_cd > 0) ? 0.5 : 1.0;
+    v -= w.w_danger * ts.danger_known * exposure * opp_ready;
+    v -= w.w_danger * w.w_uncertain * ts.danger_unknown * exposure * opp_ready;
 
     return v;
 }
 
 double evaluate_for(const sim::State& s, const Weights& w, const sim::Belief& belief,
-                    char side) {
-    if (side == 'R') return evaluate(s, w, belief);
+                    char side, bool acts_first_world) {
+    if (side == 'R') return evaluate(s, w, belief, acts_first_world);
     // 把双方对调再按同一套公式算，得到的就是"轮到 'B' 时这局面对他有多好"。
     // 注意这不是简单取负：威胁/危险两项要换成从 'B' 的朝向与位置来算，
     // 对调红蓝正好做到这一点。
+    //
+    // 先手性也要跟着对调：我是先手 ⟹ 对手是后手。
     sim::State flipped = s;
     std::swap(flipped.red, flipped.blue);
-    return evaluate(flipped, w, belief);
+    return evaluate(flipped, w, belief, !acts_first_world);
 }
 
 } // namespace brain

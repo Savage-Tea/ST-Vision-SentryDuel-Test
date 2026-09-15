@@ -104,6 +104,7 @@ brain::Weights load_weights() {
     w.w_ready = env_double("ST_W_READY", w.w_ready);
     w.w_waste = env_double("ST_W_WASTE", w.w_waste);
     w.w_uncertain = env_double("ST_W_UNCERTAIN", w.w_uncertain);
+    w.w_danger_red_scale = env_double("ST_W_DANGER_RED", w.w_danger_red_scale);
     return w;
 }
 
@@ -115,6 +116,9 @@ struct Memory {
     // 敌方位置信念。实现在 brain/SideBelief，与自对弈侧共用一份——
     // 信念是观测的一部分，两份实现漂移会让训练输入与部署输入不一致。
     brain::SideBelief belief;
+
+    // 被击中推断出的对手无力窗口（绝对回合号）。见 brain/search.h 的说明。
+    int opp_defenseless_until = -1;
 
     // 阶段③ 策略网络的隐状态。必须**跨 act() 调用存活**——它就是网络对
     // 部分可观测历史的记忆。新对局时必须清零（见 run() 开头的重置）。
@@ -139,12 +143,15 @@ sim::State local_state(const Board& b, char side) {
 //
 // 引擎的情报只在"看得见"时更新；而我们击杀对手后能推算出他回了出生点。
 // 所以我们的锚点往往比引擎的情报更准，只在从未得知时才用出生点兜底。
-void apply_belief(sim::State& st) {
+void apply_belief(sim::State& st, int turn) {
     // 搜索里用一个"代表位置"来推演：取锚点（最后已知）。
     // 不确定性由评估函数对信念取期望来体现，两者分工不同。
     g_mem.belief.write_anchor_into(st);
-    // 对手的 CD 引擎不暴露（恒为 -1），搜索里按保守值处理
-    st.blue.fire_cd = brain::kAssumedEnemyFireCd;
+    // 对手的 CD 引擎不暴露（恒为 -1），搜索里按保守值处理；
+    // 唯一例外：被击中推断出的无力窗口（对手刚开过火，是确定性情报）
+    st.blue.fire_cd = (turn <= g_mem.opp_defenseless_until)
+                          ? 2
+                          : brain::kAssumedEnemyFireCd;
     st.blue.scan_cd = 0;
 }
 
@@ -206,13 +213,22 @@ void run(const Board& board, char my_color) {
         (st.red.last_known_pos.x == my_spawn.x && st.red.last_known_pos.y == my_spawn.y);
     const bool was_at_spawn =
         (g_mem.last_my_pos.x == my_spawn.x && g_mem.last_my_pos.y == my_spawn.y);
-    bool free_turn = (board.turn == 0) || (at_spawn && !was_at_spawn);
+    const bool just_respawned = at_spawn && !was_at_spawn && board.turn > 0;
+    bool free_turn = (board.turn == 0) || just_respawned;
+
+    // 【被击中 = 对手刚开火】推断其无力窗口。我方执蓝时打我们的是红方
+    // （开火后 2 个窗口无力），执红时是蓝方（1 个窗口）——不对称再次来自
+    // CD 只在蓝方阶段后递减。窗口过期前搜索允许我们安全压近。
+    if (just_respawned) {
+        g_mem.opp_defenseless_until =
+            board.turn + ((my_color == 'B') ? 1 : 0);
+    }
 
     // —— 敌方位置信念的维护（与自对弈侧共用 brain/SideBelief）——
     g_mem.belief.begin_turn(st, board.turn, enemy_visible);
     // 策略路径不覆盖敌方位置：obs v3 要的是引擎原样的 Intel，
     // 用我们的可达集推断覆盖它就是喂给网络一个训练时见不到的输入。
-    if (!g_use_policy) apply_belief(st);
+    if (!g_use_policy) apply_belief(st, board.turn);
 
     brain::TurnInput in;
     int used = 0;
@@ -248,6 +264,10 @@ void run(const Board& board, char my_color) {
         in.used_by_now = used;
         in.free_turn_available = free_turn;
         in.enemy_visible = enemy_visible;
+        // 【关键】评估的 CD 时序不对称项需要知道世界颜色。这是整个 AI 里
+        // 唯一一处"按颜色分支"——它不是坐标分支（坐标已由镜像抹平），
+        // 而是引擎结算顺序本身的不对称（CD 只在蓝方阶段后递减）。
+        in.acts_first_world = (my_color == 'R');
 
         brain::SearchStats stats;
         brain::Plan plan;
@@ -341,7 +361,7 @@ void run(const Board& board, char my_color) {
                 g_mem.belief.infer_at({st.red.last_known_pos.x + dx,
                                        st.red.last_known_pos.y + dy});
                 g_mem.belief.anchor_facing = '?';
-                apply_belief(st);
+                apply_belief(st, board.turn);
             }
             if (failures >= kMaxFailedAttempts) break;
             continue;
@@ -373,7 +393,7 @@ void run(const Board& board, char my_color) {
         }
         // 我方这一步后视野变了 → 用新视野证伪
         g_mem.belief.after_action(st);
-        apply_belief(st);
+        apply_belief(st, board.turn);
         st.blue.visible = e.obs.opp_visible;
         enemy_visible = e.obs.opp_visible;
 

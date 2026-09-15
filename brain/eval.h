@@ -32,6 +32,15 @@ struct Weights {
     // 「信念推测出的危险」相对「锚点处确定的危险」的折扣。0 = 完全忽略推测
     // （退化为 v1 的单点危险）；1 = 与确定威胁同等对待（会瘫痪）。
     double w_uncertain = 0.25;
+
+    // CD 时序不对称（#14 的机制）：引擎的 CD 递减（end_round）只发生在
+    // 蓝方阶段之后，所以同样一枪——
+    //   世界红方开火后要熬 3 个相位（B_t, R_t+1, B_t+1）才能再开火，
+    //   世界蓝方只要 1 个相位（R_t+1）。
+    // 换算成对手的可乘虚窗口：红 2 个，蓝 1 个。当我方 fire_cd>0（打不了还手）
+    // 时，"我在敌方火力通道内"的代价按这个比例放大（2.0 = 按窗口数）。
+    // 1.0 = 关闭不对称（旧行为），用于同口径 A/B。
+    double w_danger_red_scale = 2.0;
 };
 
 // 对手的 fire_cd / scan_cd 在观测里恒为 -1（引擎不暴露），
@@ -68,11 +77,16 @@ struct ThreatStats {
 ThreatStats threat_stats(const sim::State& s, const sim::Belief& belief);
 
 // 局面评估，分数越高对我方越有利。belief 为敌方可能位置集合。
-double evaluate(const sim::State& s, const Weights& w, const sim::Belief& belief);
+// acts_first_world：我方在世界坐标里是否先手（执红）。局部框架抹平了颜色，
+// 但 CD 递减只发生在蓝方阶段后，火炮未就绪时的暴露代价红蓝不对称——
+// 见 Weights::w_danger_red_scale。传 true 即旧行为（对称）。
+double evaluate(const sim::State& s, const Weights& w, const sim::Belief& belief,
+                bool acts_first_world);
 
 // 从任意一方的视角评估（MCTS 的负极大值回传需要它：
 // 树里既有我方走子的节点也有对手走子的节点，叶值必须按"轮到谁"取视角）。
+// 我方先手 = 红 ⟹ 对手后手；反之亦然。
 double evaluate_for(const sim::State& s, const Weights& w, const sim::Belief& belief,
-                    char side);
+                    char side, bool acts_first_world);
 
 } // namespace brain

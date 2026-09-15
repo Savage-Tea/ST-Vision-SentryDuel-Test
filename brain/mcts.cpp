@@ -46,6 +46,7 @@ public:
         : w_(w), cfg_(cfg), dl_(dl), rng_(cfg.seed) {}
 
     MctsResult run(const TurnInput& in) {
+        acts_first_world_ = in.acts_first_world;
         root_bans_ = &in.bans;
         root_enemy_visible_ = in.enemy_visible;
 
@@ -95,7 +96,8 @@ private:
     // 随机走子到终局几乎没有信息量。
     double leaf_value(const Node& n) const {
         if (n.terminal) return terminal_value(n.state, n.to_move);
-        return evaluate_for(n.state, w_, n.belief, n.to_move);
+        return evaluate_for(n.state, w_, n.belief, n.to_move,
+                            (n.to_move == 'R') == acts_first_world_);
     }
 
     // 由父节点的动作生成子节点；不可行返回 -1
@@ -163,7 +165,9 @@ private:
             const int ci = make_child(idx, c);
             n.child.push_back(ci);
             child_value.push_back(ci >= 0 ? evaluate_for(nodes_[ci].state, w_,
-                                                         nodes_[ci].belief, n.to_move)
+                                                         nodes_[ci].belief, n.to_move,
+                                                         (n.to_move == 'R') ==
+                                                             acts_first_world_)
                                           : -kWinValue);
         }
 
@@ -336,6 +340,8 @@ private:
     }
 
     const Weights& w_;
+    // 我方（局部 'R'）在世界坐标里是否先手；来自 TurnInput，见 eval.h
+    bool acts_first_world_ = true;
     const MctsConfig& cfg_;
     const Deadline& dl_;
     std::mt19937 rng_;
