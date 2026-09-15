@@ -277,11 +277,11 @@ int main(int argc, char** argv) {
                         }
                     };
 
+                    const char my_facing = s.sentry_for(side).last_known_facing;
                     emit(sim::kMove, 0);
-                    emit(sim::kTurn, 'N');
-                    emit(sim::kTurn, 'E');
-                    emit(sim::kTurn, 'S');
-                    emit(sim::kTurn, 'W');
+                    for (char f : {'N', 'E', 'S', 'W'}) {
+                        if (f != my_facing) emit(sim::kTurn, f);
+                    }
                     emit(sim::kFire, 0);
                     emit(sim::kScan, 0);
 
@@ -397,11 +397,11 @@ int main(int argc, char** argv) {
 
                 // 额度用尽时只有"收手"一条路
                 if (ac < brain::kMaxActionsPerTurn) {
+                    const char my_facing = s.sentry_for(side).last_known_facing;
                     consider(sim::kMove, 0);
-                    consider(sim::kTurn, 'N');
-                    consider(sim::kTurn, 'E');
-                    consider(sim::kTurn, 'S');
-                    consider(sim::kTurn, 'W');
+                    for (char f : {'N', 'E', 'S', 'W'}) {
+                        if (f != my_facing) consider(sim::kTurn, f);
+                    }
                     consider(sim::kFire, 0);
                     consider(sim::kScan, 0);
                 }
