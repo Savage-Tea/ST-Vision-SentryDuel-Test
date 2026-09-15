@@ -114,8 +114,10 @@ def main() -> int:
     ap.add_argument("--epochs", type=int, default=4, help="每批数据的复用轮数")
     ap.add_argument("--batch", type=int, default=32, help="每条 minibatch 的序列数")
     ap.add_argument("--lr", type=float, default=3e-4)
-    ap.add_argument("--gamma", type=float, default=0.99)
-    ap.add_argument("--lam", type=float, default=0.95)
+    ap.add_argument("--gamma", type=float, default=1.0,
+                    help="有限局、必有终局：回报=净胜分，折扣只会白白衰减信用")
+    ap.add_argument("--lam", type=float, default=1.0,
+                    help="λ=1 => MC 优势，无偏；critic 弱时不引入 bootstrap 偏差")
     ap.add_argument("--clip", type=float, default=0.2)
     ap.add_argument("--vf-coef", type=float, default=0.5)
     ap.add_argument("--ent-coef", type=float, default=0.05,

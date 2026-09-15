@@ -29,6 +29,23 @@ static_assert(kPolicyObsDim == obs::kObsDimV3,
 // 是否编译进了训练好的权重
 bool policy_available();
 
+// ── 运行时加载的一套权重（自对弈生成器的对手池用）──
+// 部署路径不受影响：仍用编译期权重的 policy_forward。
+// data 是全部权重的连续块，释放只需 policy_free_weights。
+struct PolicyWeights {
+    float* data = nullptr;
+    const float *encW, *encB, *wih, *whh, *bih, *bhh, *polW, *polB, *valW, *valB;
+};
+
+// 读 tools/policy_net.py 导出的 .bin（4×u32 维度 + 按 WEIGHTS 表顺序的 f32）。
+// 维度与编译期常量不符时返回 false——那是网络结构改了但权重没重新导出。
+bool policy_load_bin(const char* path, PolicyWeights& out);
+void policy_free_weights(PolicyWeights& w);
+
+// 用运行时权重跑同一个前向。hidden 语义与 policy_forward 完全一致。
+bool policy_forward_w(const PolicyWeights& w, const float* obs, float* hidden,
+                      float* policy_logits, float* value);
+
 // 把隐状态清零。**新对局开始时必须调用**，否则上一局的记忆会污染这一局。
 void policy_reset_hidden(float* hidden);
 

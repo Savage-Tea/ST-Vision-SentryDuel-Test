@@ -34,3 +34,4 @@ checkpoints/
 # 仍能构建和运行，只是没有策略。
 brain/net_weights.h
 brain/policy_weights.h
+brain/policy_weights.bin

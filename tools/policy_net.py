@@ -17,6 +17,7 @@ policy_net.cpp 里有 static_assert 会把维度不符挡在编译期。
 from __future__ import annotations
 
 import os
+import struct
 from pathlib import Path
 
 # 同 train_mlp.py：必须在 import torch 之前设置。昇腾节点上装了 torch_npu，
@@ -120,6 +121,17 @@ def export_weights(net: Net, path: Path) -> None:
         print(f"  ⚠ 有 {literal.bad} 个非有限权值，已写成 0（训练可能发散了）")
     path.write_text("\n".join(lines))
     print(f"  权重头文件 {path}  ({path.stat().st_size / 1024:.0f} KB)")
+
+    # 同时导出一份二进制，给自对弈生成器做**运行时**加载（对手池用）。
+    # 部署路径仍然只用头文件（编译进 .so，平台没有运行时文件可读）。
+    # 布局：4×u32 维度，然后按 WEIGHTS 表顺序的原始 f32——
+    # brain/policy_net.cpp 的 policy_load_bin 按同一张表读，两处必须同步。
+    bin_path = path.with_suffix(".bin")
+    with bin_path.open("wb") as f:
+        f.write(struct.pack("<IIII", OBS_DIM, ENC_DIM, HIDDEN, ACT_DIM))
+        for _sym, key, shape in WEIGHTS:
+            f.write(np.ascontiguousarray(sd[key], dtype="<f4").tobytes())
+    print(f"  权重二进制 {bin_path}  ({bin_path.stat().st_size / 1024:.0f} KB)")
 
 
 if __name__ == "__main__":

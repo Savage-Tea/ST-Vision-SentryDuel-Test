@@ -276,6 +276,32 @@ int main(int argc, char** argv) {
     const char* name[] = {"红负", "平", "红胜"};
     std::printf("\n════════ 结果 ════════\n");
     std::printf("  值            %s\n", name[v + 1]);
+
+    // 打印根节点的最优首手。一个荒谬的首手（原地不动、对着墙开火）能立刻
+    // 证伪整个搜索；合理的话只是必要不充分条件。
+    {
+        const int pr = encode_pose(init.red), pb = encode_pose(init.blue);
+        const std::uint64_t rk = make_key(pr, pb, init.turn, 0, 0, 3, 0);
+        auto it = g_tt.find(rk);
+        if (it != g_tt.end() && it->second.best != 255) {
+            const int mi = it->second.best;
+            std::vector<Move> mv;
+            gen_moves(init, 'R', mv);
+            if (mi == 254) {
+                std::printf("  最优首手      收手（结束本阶段）\n");
+            } else if (mi < static_cast<int>(mv.size())) {
+                const char* an[] = {"move", "turn", "fire", "scan"};
+                std::printf("  最优首手      %s%s%c   红方位置 (%d,%d) 朝 %c\n",
+                            an[mv[mi].action],
+                            mv[mi].action == sim::kTurn ? " " : "",
+                            mv[mi].action == sim::kTurn ? mv[mi].arg : ' ',
+                            init.red.last_known_pos.x, init.red.last_known_pos.y,
+                            init.red.last_known_facing);
+            }
+        } else {
+            std::printf("  最优首手      （置换表里没找到根节点）\n");
+        }
+    }
     std::printf("  展开状态      %lld\n", g_nodes);
     std::printf("  置换表命中    %lld\n", g_tt_hits);
     std::printf("  上界截断      %lld\n", g_futile_cuts);

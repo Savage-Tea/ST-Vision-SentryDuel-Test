@@ -47,9 +47,21 @@ for r in $(seq 1 "$ROUNDS"); do
     echo "################ 第 $r / $ROUNDS 轮 ################"
 
     echo "--- [1/4] 用当前策略生成 $GAMES 局轨迹 ---"
+    # 对手池：50% 概率让蓝方用近 5 轮中的随机历史版本。
+    # 打破"永远和当前自己打"的循环退化（实测 r4→r5 出现回退）。
+    OPP_ARG=""
+    if [ "$r" -gt 1 ] && [ $((RANDOM % 2)) -eq 0 ]; then
+        lo=$((r - 5)); [ "$lo" -lt 1 ] && lo=1
+        hi=$((r - 1))
+        k=$((lo + RANDOM % (hi - lo + 1)))
+        OPP_ARG="--opp-weights $OUT/policy_w_r$k.bin"
+        echo "    对手: 第 $k 轮的历史版本（池）"
+    else
+        echo "    对手: 当前策略"
+    fi
     ./build/selfplay_ppo --games "$GAMES" --threads "$THREADS" \
         --temperature "$TEMPERATURE" --seed "$((r * 1000))" \
-        --out "$OUT/round$r.bin"
+        $OPP_ARG --out "$OUT/round$r.bin"
 
     echo "--- [2/4] PPO 更新 $EPOCHS 轮 ---"
     python3 tools/train_ppo.py --data "$OUT/round$r.bin" --epochs "$EPOCHS" \
@@ -58,6 +70,7 @@ for r in $(seq 1 "$ROUNDS"); do
     echo "--- [3/4] 用新权重重编（下一轮采样要用它）---"
     make selfplay-ppo >/dev/null
     cp brain/policy_weights.h "$OUT/policy_weights_r$r.h"
+    cp brain/policy_weights.bin "$OUT/policy_w_r$r.bin"
 
     echo "--- [4/4] 存档 ---"
     # 存样本量而不只是局数：有效步数才是训练的规模

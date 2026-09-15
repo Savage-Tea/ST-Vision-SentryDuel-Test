@@ -125,8 +125,9 @@ def main() -> int:
     # 让它在输出里可见——否则会误以为"奖励信号坏了"。
     print(f"  末步胜负：赢 {pos_last}  输 {neg_last}  平 {len(t.seqs) - pos_last - neg_last}"
           f"   —— 未训练策略下平局占比高是正常的")
-    if pos_last == 0 or neg_last == 0:
-        print("  ⚠ 这一批里 ±1 终局加成只有一侧出现过，终局路径未被完整覆盖")
+    # 纯边际回报下，末步只在"最后一个行动恰好得分"时非零，通常为 0——正常。
+    if pos_last == 0 and neg_last == 0:
+        print("  （末步奖励为 0 属正常：回报由全程计分累计，不在末步集中）")
 
     if not args.keep:
         traj.unlink(missing_ok=True)

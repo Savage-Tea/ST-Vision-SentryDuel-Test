@@ -63,39 +63,18 @@ constexpr uint32_t kVersion = 1;
 
 // 击杀得分。与引擎 board.cpp 的 `me.score += 2` 一致。
 constexpr float kKillReward = 2.0f;
-// 终局胜负加成。从 1.0 提到 3.0：让"赢"相对塑形项更有分量，
-// 避免策略只学会走位不学会赢。
-constexpr float kTerminalReward = 3.0f;
-
-// ── 基于势能的奖励塑形 ──
+// ── 奖励设计（方案 A：纯边际回报）──
 //
-// F(s,s') = γ·Φ(s') − Φ(s)，其中 Φ = −w·(到最近得分区的曼哈顿距离)。
+// 只保留**真实计分**：击杀 +2（引擎加分处）、占点 +1（阶段末结算处）。
+// 于是每条序列的回报**恰好等于该方的最终净胜分**——不多不少。
 //
-// **必须写成这个形式。** 任意加塑形项会改变最优策略（比如"靠近得分区就加分"
-// 会让最优解变成贴着得分区蹭而不进去）。基于势能的塑形是唯一有理论保证
-// 不改变最优策略的加法（Ng/Harada/Russell 1999）。
+// 删掉的两项及原因（都实测过）：
+//   · 势能塑形：轨迹求和望远镜抵消（Σ F ≈ γᵀΦ(s_T) − Φ(s₀)），与路径无关
+//     ——这正是它"不改变最优策略"的原因，也意味着它几乎不改变优势函数。
+//     实测密度 0.6%→72.8% 而强度零变化。
+//   · 终局 ±3：净胜分本身已编码符号与大小，阶跃项冗余。
 //
-// 为什么需要它：未训练策略几乎不得分（83% 的局是 0-0），原始奖励只有 0.6%
-// 的步非零，"什么都不做"和"到处乱走"得分完全一样，策略没有任何理由动起来。
-// Φ 给出"往中心走"的梯度，而停在原地得 0、来回走正负抵消——不会奖励蹭边。
-//
-// γ 必须与训练侧的折扣一致（tools/train_ppo.py 的 --gamma 默认 0.99），
-// 否则不变性不成立。
-constexpr float kShapeW = 0.05f;
-constexpr float kGamma = 0.99f;
-
-// 势能：到最近得分区的距离的负数
-float potential(const sim::State& w, char side) {
-    const Sentry& me = w.sentry_for(side);
-    int best = 1 << 20;
-    for (const Pos& z : w.score_zones) {
-        const int d = std::abs(z.x - me.last_known_pos.x) +
-                      std::abs(z.y - me.last_known_pos.y);
-        if (d < best) best = d;
-    }
-    if (best >= (1 << 20)) return 0.0f;
-    return -kShapeW * static_cast<float>(best);
-}
+// 配套：训练侧 γ=1.0、λ=1.0（MC 优势）。回报 = 净胜分，无偏且不依赖弱 critic。
 
 struct Step {
     float obs[obs::kObsDimV3];
@@ -140,6 +119,12 @@ void append_step(SideTraj& t, const float* obs, int action, float reward) {
     t.steps.push_back(s);
 }
 
+// ── 对手池（方案 B）──
+// 蓝方可以用一份**运行时加载**的历史权重，打破"永远和当前自己打"的循环退化
+// （实测 r4→r5 回退）。红方永远用当前权重。hidden 双方本来就各自一份。
+brain::PolicyWeights g_opp{};
+bool g_has_opp = false;
+
 // 跑一局，把红蓝两条序列写进 out_red / out_blue。
 void play_game(unsigned seed, SideTraj& traj_r, SideTraj& traj_b) {
     std::mt19937 rng(seed);
@@ -176,7 +161,13 @@ void play_game(unsigned seed, SideTraj& traj_r, SideTraj& traj_b) {
 
                 float logits[brain::kPolicyActDim];
                 float value = 0.0f;
-                if (!brain::policy_forward(obs, t.hidden, logits, &value)) {
+                bool ok;
+                if (si == 1 && g_has_opp) {
+                    ok = brain::policy_forward_w(g_opp, obs, t.hidden, logits, &value);
+                } else {
+                    ok = brain::policy_forward(obs, t.hidden, logits, &value);
+                }
+                if (!ok) {
                     // 没有权重就不该跑到这里——上游必须先导出 policy_weights.h
                     std::fprintf(stderr, "selfplay_ppo: 策略网络不可用\n");
                     std::exit(1);
@@ -187,7 +178,6 @@ void play_game(unsigned seed, SideTraj& traj_r, SideTraj& traj_b) {
 
                 if (a == brain::kActionDim - 1) break; // 收手，结束本阶段
 
-                const float phi_before = potential(world, side);
                 const brain::Cand world_c =
                     brain::local_to_world(brain::index_to_cand(a), side);
                 bool hit = false;
@@ -196,8 +186,6 @@ void play_game(unsigned seed, SideTraj& traj_r, SideTraj& traj_b) {
                     // 但我们不能就此中止——继续本阶段剩下的额度，让它从后果里学。
                     continue;
                 }
-                // 势能塑形：γ·Φ(s') − Φ(s)。加在**行动后的那一步**上。
-                t.steps.back().reward += kGamma * potential(world, side) - phi_before;
                 if (hit) {
                     // 击杀：即时奖励记在**开火那一步**（引擎在这里 +2 分）
                     t.steps.back().reward += kKillReward;
@@ -227,16 +215,7 @@ void play_game(unsigned seed, SideTraj& traj_r, SideTraj& traj_b) {
         if (brain::is_terminal(world)) finished = true;
     }
 
-    // 终局加成：记在各自序列的最后一步。
-    for (int si = 0; si < 2; ++si) {
-        const char side = (si == 0) ? 'R' : 'B';
-        const Sentry& me = world.sentry_for(side);
-        const Sentry& opp = world.sentry_for((si == 0) ? 'B' : 'R');
-        const float z = (me.score > opp.score) ? 1.0f
-                        : (me.score < opp.score) ? -1.0f : 0.0f;
-        SideTraj& t = *traj[si];
-        if (!t.steps.empty()) t.steps.back().reward += z * kTerminalReward;
-    }
+    // 终局不再追加奖励：各步真实计分的累计已经**就是**净胜分。
 }
 
 // —— 输出：一个全局互斥锁保护的文件追加 ——
@@ -269,6 +248,16 @@ int main(int argc, char** argv) {
         else if (a == "--temperature") { const char* v = next(i); if (v) g_opt.temperature = std::atof(v); }
         else if (a == "--seed") { const char* v = next(i); if (v) g_opt.seed = static_cast<unsigned>(std::atoi(v)); }
         else if (a == "--out") { const char* v = next(i); if (v) g_opt.out = v; }
+        else if (a == "--opp-weights") {
+            const char* v = next(i);
+            if (v != nullptr) {
+                if (!brain::policy_load_bin(v, g_opp)) {
+                    std::fprintf(stderr, "对手权重加载失败: %s\n", v);
+                    return 1;
+                }
+                g_has_opp = true;
+            }
+        }
         else if (a == "-h" || a == "--help") {
             std::printf("用法: %s --games N --out FILE [--threads N] [--temperature T] [--seed S]\n",
                         argv[0]);
@@ -303,8 +292,9 @@ int main(int argc, char** argv) {
         std::fwrite(&games, sizeof(games), 1, g_out);
     }
 
-    std::printf("策略自对弈: %d 局 / %d 线程 / 温度 %.2f\n", g_opt.games,
-                g_opt.threads, g_opt.temperature);
+    std::printf("策略自对弈: %d 局 / %d 线程 / 温度 %.2f%s\n", g_opt.games,
+                g_opt.threads, g_opt.temperature,
+                g_has_opp ? "  [蓝方=池中对手]" : "");
 
     const auto t0 = Clock::now();
     std::atomic<int> done{0};
