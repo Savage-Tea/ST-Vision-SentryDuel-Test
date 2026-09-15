@@ -15,7 +15,9 @@
 #include "brain/eval.h"
 #include "brain/mcts.h"
 #include "brain/net.h"
+#include "brain/policy_net.h"
 #include "brain/search.h"
+#include "obs/encode_v3.h"
 #include "sim/belief.h"
 #include "sim/rules.h"
 #include "sentry_duel.h"
@@ -62,6 +64,16 @@ const bool g_debug = env_flag("ST_DEBUG");
 // 代价：网络目前只在 MCTS 路径上被读取，默认路径下不参与决策。
 const bool g_use_mcts = env_flag("ST_MCTS");
 
+// 阶段③：策略网络直接决策（不搜索）。
+//
+// 与 MCTS 路径的根本差别在**观测口径**：策略网络吃的是 obs v3，它不含手工
+// 信念，敌方位置用的是**引擎给的 Intel**。而搜索路径会调 apply_belief() 用
+// 我们自己的可达集推断覆盖掉那个值。两条路径的输入不同，绝不能混用——
+// 混了就是训练/部署漂移，而且不会报错。
+//
+// 部署默认仍走阶段①。这条路径要先用分色评测证明更强，才能改默认。
+const bool g_use_policy = env_flag("ST_POLICY");
+
 double env_double(const char* name, double fallback); // 定义见下方
 
 brain::MctsConfig load_mcts_config() {
@@ -103,6 +115,10 @@ struct Memory {
     // 敌方位置信念。实现在 brain/SideBelief，与自对弈侧共用一份——
     // 信念是观测的一部分，两份实现漂移会让训练输入与部署输入不一致。
     brain::SideBelief belief;
+
+    // 阶段③ 策略网络的隐状态。必须**跨 act() 调用存活**——它就是网络对
+    // 部分可观测历史的记忆。新对局时必须清零（见 run() 开头的重置）。
+    float policy_hidden[brain::kPolicyHidden] = {};
 };
 Memory g_mem;
 
@@ -175,7 +191,10 @@ void run(const Board& board, char my_color) {
     const Clock::time_point deadline = Clock::now() + std::chrono::milliseconds(g_budget_ms);
 
     // 新对局：重置跨回合记忆（同进程只跑一局，这里是防御性写法）
-    if (board.turn == 0 || board.turn < g_mem.last_turn) g_mem = Memory{};
+    if (board.turn == 0 || board.turn < g_mem.last_turn) {
+        g_mem = Memory{};
+        brain::policy_reset_hidden(g_mem.policy_hidden);
+    }
 
     sim::State st = local_state(board, my_color);
     bool enemy_visible = st.blue.visible;
@@ -191,7 +210,9 @@ void run(const Board& board, char my_color) {
 
     // —— 敌方位置信念的维护（与自对弈侧共用 brain/SideBelief）——
     g_mem.belief.begin_turn(st, board.turn, enemy_visible);
-    apply_belief(st);
+    // 策略路径不覆盖敌方位置：obs v3 要的是引擎原样的 Intel，
+    // 用我们的可达集推断覆盖它就是喂给网络一个训练时见不到的输入。
+    if (!g_use_policy) apply_belief(st);
 
     brain::TurnInput in;
     int used = 0;
@@ -230,7 +251,31 @@ void run(const Board& board, char my_color) {
 
         brain::SearchStats stats;
         brain::Plan plan;
-        if (g_use_mcts) {
+        if (g_use_policy) {
+            // 策略网络直接出动作：obs v3 → GRU → argmax
+            float obs_v3[obs::kObsDimV3];
+            obs::encode_v3(st, enemy_visible, used, free_turn, obs_v3);
+            float logits[brain::kPolicyActDim];
+            float value = 0.0f;
+            if (brain::policy_forward(obs_v3, g_mem.policy_hidden, logits, &value)) {
+                int best = 0;
+                for (int i = 1; i < brain::kPolicyActDim; ++i) {
+                    if (logits[i] > logits[best]) best = i;
+                }
+                // 部署取 argmax 而不是采样：单局要的是最可能的那手，
+                // 不是从分布里抽一发（自对弈侧才需要噪声保证多样性）
+                const brain::Cand c = brain::index_to_cand(best);
+                if (c.action == brain::kStopAction) {
+                    plan.valid = false;   // 收手 = 本阶段结束
+                } else {
+                    plan.valid = true;
+                    plan.count = 1;
+                    plan.actions[0] = c.action;
+                    plan.args[0] = c.arg;
+                    plan.value = value;
+                }
+            }
+        } else if (g_use_mcts) {
             // 本 act 内每步都会重新规划，所以把剩余时间按剩余步数**均分**，
             // 否则第一步会把整个 act 的预算吃光。
             const int steps_left =
@@ -319,6 +364,12 @@ void run(const Board& board, char my_color) {
         if (e.obs.opp_visible) {
             g_mem.belief.collapse(e.obs.opp_last_known_pos,
                                   e.obs.opp_last_known_facing);
+        }
+        if (g_use_policy) {
+            // sim 推演出来的 st.blue.last_known_pos 是**真实位置**，
+            // 而策略网络要的是引擎观测里的 Intel。必须覆盖回去。
+            st.blue.last_known_pos = e.obs.opp_last_known_pos;
+            st.blue.last_known_facing = e.obs.opp_last_known_facing;
         }
         // 我方这一步后视野变了 → 用新视野证伪
         g_mem.belief.after_action(st);

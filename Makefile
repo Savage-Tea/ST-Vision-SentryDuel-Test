@@ -25,6 +25,10 @@ ENGINE_LINK := -L$(ENGINE_BUILD) -lsentry_duel_engine -Wl,-rpath,'$$ORIGIN/engin
 #
 # 本项目编译只要几秒，宁可多编一次，也不要用旧二进制。
 HDRS := $(shell find . -name '*.h' -not -path './build/*' 2>/dev/null)
+# Makefile 自身也算先决条件：改了 AI_SRC 这类变量时必须重链，否则 make 认为
+# "产物比源码新"直接跳过——实测踩过：给 AI_SRC 补了两个 .cpp，编译没发生，
+# .so 里缺符号，直到 dlopen 才炸。
+HDRS += Makefile
 
 .PHONY: all engine opponents ai test test-quick clean selfplay-ppo test-policy test-view test-obs-v3
 
@@ -57,7 +61,8 @@ $(BUILD)/opponents/det_ai_%.so: $(SENTRY_DUEL_ROOT)/engine/tests/det_ai_%.cpp
 # —— 我们的 AI（阶段①：搜索 + policy model）——
 AI_SRC := agent/act.cpp brain/eval.cpp brain/actions.cpp brain/search.cpp \
           brain/mcts.cpp brain/belief_state.cpp brain/net.cpp \
-          obs/encode.cpp sim/rules.cpp sim/belief.cpp
+          brain/policy_net.cpp obs/encode.cpp obs/encode_v3.cpp \
+          sim/view_mirror.cpp sim/rules.cpp sim/belief.cpp
 
 $(BUILD)/my_ai.so: $(AI_SRC) $(HDRS) | engine
 	$(CXX) $(CXXFLAGS) -shared -Wl,-z,lazy -Wl,--allow-shlib-undefined \
