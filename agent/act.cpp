@@ -74,6 +74,11 @@ const bool g_use_mcts = env_flag("ST_MCTS");
 // 部署默认仍走阶段①。这条路径要先用分色评测证明更强，才能改默认。
 const bool g_use_policy = env_flag("ST_POLICY");
 
+// 被击中推断"对手刚开火、正无力"的窗口。默认关闭：检测条件（从非出生点
+// 变为出生点）与"自己走回出生点"无法区分，假阳性会让我们误信对手 CD=2
+// 而冒进。实验用 ST_OPP_WINDOW=1 开启（且仅执蓝生效，蓝方窗口收益大）。
+const bool g_opp_window = env_flag("ST_OPP_WINDOW");
+
 double env_double(const char* name, double fallback); // 定义见下方
 
 brain::MctsConfig load_mcts_config() {
@@ -219,9 +224,8 @@ void run(const Board& board, char my_color) {
     // 【被击中 = 对手刚开火】推断其无力窗口。我方执蓝时打我们的是红方
     // （开火后 2 个窗口无力），执红时是蓝方（1 个窗口）——不对称再次来自
     // CD 只在蓝方阶段后递减。窗口过期前搜索允许我们安全压近。
-    if (just_respawned) {
-        g_mem.opp_defenseless_until =
-            board.turn + ((my_color == 'B') ? 1 : 0);
+    if (just_respawned && g_opp_window && my_color == 'B') {
+        g_mem.opp_defenseless_until = board.turn + 1;
     }
 
     // —— 敌方位置信念的维护（与自对弈侧共用 brain/SideBelief）——
