@@ -29,9 +29,13 @@ import os
 import sys
 from pathlib import Path
 
-# 必须在 import torch 之前。昇腾节点上 torch 会自动加载设备后端，
-# 没 source CANN 的话整个 import 直接失败；我们这个小网络 CPU 就够。
-os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
+# 必须在 import torch 之前。
+# 默认关掉设备后端自动加载——昇腾节点上没 source CANN 时它会让 import 直接
+# 失败，而我们之前一直跑 CPU，不该被这个连累。要用 NPU 时显式加 --device npu，
+# 那一支会在 import 前把开关打开。
+import sys as _sys
+_USE_NPU = "--device" in _sys.argv and "npu" in _sys.argv
+os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "1" if _USE_NPU else "0")
 
 import numpy as np
 import torch
@@ -81,7 +85,7 @@ def pad_sequences(seqs, max_len=None):
 def forward(net, obs, lengths):
     """按序列前向。hidden 每条序列从零开始。返回 logits / value。"""
     B, T, _ = obs.shape
-    h = torch.zeros(1, B, HIDDEN)
+    h = torch.zeros(1, B, HIDDEN, device=obs.device)
     enc = torch.relu(net.enc(obs))
     out, _ = net.gru(enc, h)          # padding 在末尾，不影响有效步
     return net.pol(out), net.val(out).squeeze(-1)
@@ -118,6 +122,8 @@ def main() -> int:
     ap.add_argument("--out", default="build/policy.npz")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--threads", type=int, default=8)
+    ap.add_argument("--device", default="cpu", choices=["cpu", "npu"],
+                    help="npu 需要先 source CANN 环境")
     ap.add_argument("--export-only", action="store_true")
     args = ap.parse_args()
 
@@ -150,14 +156,21 @@ def main() -> int:
     print(f"  步数 中位 {int(np.median(lengths))} / 最大 {int(lengths.max())}")
     print(f"  奖励 非零步占比 {(rew != 0).mean() * 100:.2f}%   总和 {rew.sum():+.1f}")
 
-    net = Net()
+    net = Net().to(DEV)
     opt = torch.optim.Adam(net.parameters(), lr=args.lr)
     print(f"  参数量 {sum(p.numel() for p in net.parameters()):,}")
 
-    O = torch.from_numpy(obs)
-    A = torch.from_numpy(act)
-    R = torch.from_numpy(rew)
-    M = torch.from_numpy(mask)
+    # 设备。大 batch 下 NPU 的算子派发开销能被摊薄，小 batch 反而更慢，
+    # 所以这里的 batch 与 device 要一起调。
+    DEV = torch.device(args.device) if args.device == "cpu" else torch.device("npu:0")
+    if args.device == "npu":
+        import torch_npu  # noqa: F401
+        print(f"  设备 npu:0  可用={torch.npu.is_available()} 卡数={torch.npu.device_count()}")
+    O = torch.from_numpy(obs).to(DEV)
+    A = torch.from_numpy(act).to(DEV)
+    R = torch.from_numpy(rew).to(DEV)
+    M = torch.from_numpy(mask).to(DEV)
+    old_logp_all = old_logp_all.to(DEV) if False else None
 
     rng = np.random.default_rng(args.seed)
     n = len(t.seqs)
@@ -172,9 +185,9 @@ def main() -> int:
     #     变成追一个移动靶，损失不降反升（实测 0.235 -> 0.795）
     # 正确的做法与 PPO 论文一致：old 是**采样时**的策略，整轮更新期间冻结。
     print("\n  预计算 old_logprob / GAE")
-    old_logp_all = torch.zeros(n, obs.shape[1])
-    adv_all = torch.zeros(n, obs.shape[1])
-    ret_all = torch.zeros(n, obs.shape[1])
+    old_logp_all = torch.zeros(n, obs.shape[1], device=DEV)
+    adv_all = torch.zeros(n, obs.shape[1], device=DEV)
+    ret_all = torch.zeros(n, obs.shape[1], device=DEV)
     with torch.no_grad():
         for s in range(0, n, args.batch):
             idx = np.arange(s, min(s + args.batch, n))
@@ -183,10 +196,10 @@ def main() -> int:
             logits, value = forward(net, bo, blen)
             logp = torch.log_softmax(logits, dim=-1)
             old_logp_all[b] = logp.gather(-1, A[b].unsqueeze(-1)).squeeze(-1)
-            adv, ret = compute_gae(R[b].numpy(), value, M[b].numpy(),
-                                   args.gamma, args.lam)
-            adv_all[b] = torch.from_numpy(adv)
-            ret_all[b] = torch.from_numpy(ret)
+            adv, ret = compute_gae(R[b].cpu().numpy(), value.cpu(),
+                                   M[b].cpu().numpy(), args.gamma, args.lam)
+            adv_all[b] = torch.from_numpy(adv).to(DEV)
+            ret_all[b] = torch.from_numpy(ret).to(DEV)
 
         # 优势标准化：只统计有效步，否则 padding 的 0 会把均值方差带偏
         valid_all = M.sum()
@@ -241,7 +254,7 @@ def main() -> int:
 
     out_path = ROOT / args.out if not Path(args.out).is_absolute() else Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(net.state_dict(), out_path)
+    torch.save({k: v.cpu() for k, v in net.state_dict().items()}, out_path)
     print(f"\n检查点 -> {out_path.relative_to(ROOT)}")
     export_weights(net, WEIGHTS_HEADER)
     print("\n下一步：make selfplay-ppo（重建生成器）后即可用新策略采样。")
