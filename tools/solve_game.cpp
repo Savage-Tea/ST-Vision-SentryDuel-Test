@@ -42,7 +42,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <thread>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #include <vector>
 
 namespace {
@@ -155,14 +159,26 @@ inline void set_value(std::uint64_t v, int val) {
     g_value[w] = (g_value[w] & ~(3ULL << sh)) | (static_cast<std::uint64_t>(val & 3) << sh);
 }
 
-// 正向枚举用的访问位图
+// 正向枚举用的访问位图。**并行版本用原子 test-and-set**：
+// 多个线程会同时认领同一批后继，靠 CAS 保证只有一个线程把它收进缓冲。
 std::vector<std::uint64_t> g_seen;
 inline bool mark(std::uint64_t v) {
-    const std::uint64_t w = v >> 6, b = v & 63;
-    if (g_seen[w] >> b & 1ULL) return false;
-    g_seen[w] |= 1ULL << b;
-    return true;
+    const std::uint64_t w = v >> 6;
+    const std::uint64_t mask = 1ULL << (v & 63);
+    const std::uint64_t old = __atomic_fetch_or(&g_seen[w], mask, __ATOMIC_RELAXED);
+    return (old & mask) == 0;
 }
+
+// 每线程的后继缓冲：线程之间不碰同一份内存，层末再合并。
+// 直接往全局桶里 push 需要加锁，10^10 次 push 的锁开销会把并行收益吃光。
+struct EmitBuffers {
+    std::vector<std::vector<std::uint64_t>> buckets; // kLayers * kFreeN
+    void init() { buckets.assign(static_cast<std::size_t>(kLayers) * kFreeN, {}); }
+    void clear() {
+        for (auto& b : buckets) b.clear();
+    }
+};
+std::vector<EmitBuffers> g_tls;
 
 // 每层每 free 标志一份状态表
 using LayerTable = std::vector<std::vector<std::uint64_t>>;
@@ -219,8 +235,15 @@ int main(int argc, char** argv) {
         mark(start);
         g_states[0 * kFreeN + 3].push_back(start);
 
-        std::vector<brain::Cand> tmp;
-        long long total = 0;
+        int nthreads = 1;
+#ifdef _OPENMP
+        nthreads = omp_get_max_threads();
+#endif
+        g_tls.assign(static_cast<std::size_t>(nthreads), EmitBuffers{});
+        for (auto& t : g_tls) t.init();
+        std::printf("  线程数 %d\n", nthreads);
+        std::fflush(stdout);
+        std::atomic<long long> total{0};
 
         for (int layer = 0; layer < kLayers; ++layer) {
             const int turn = layer / (kSideN * kAcN);
@@ -233,9 +256,13 @@ int main(int argc, char** argv) {
             // 所以正向按 3→0 的顺序处理即可
             for (int ff = kFreeN - 1; ff >= 0; --ff) {
                 auto& list = g_states[static_cast<std::size_t>(layer) * kFreeN + ff];
-                for (std::size_t i = 0; i < list.size(); ++i) {
-                    const std::uint64_t v = list[i];
-                    ++total;
+                const std::ptrdiff_t n_states = static_cast<std::ptrdiff_t>(list.size());
+#pragma omp parallel for schedule(dynamic, 256)
+                for (std::ptrdiff_t i = 0; i < n_states; ++i) {
+                    const int tid = omp_get_thread_num();
+                    auto& tls = g_tls[static_cast<std::size_t>(tid)];
+                    const std::uint64_t v = list[static_cast<std::size_t>(i)];
+                    total.fetch_add(1, std::memory_order_relaxed);
                     const Decoded d = decode(v);
 
                     if (terminal_of(d.turn, d.diff)) continue;
@@ -272,7 +299,7 @@ int main(int argc, char** argv) {
                         const std::uint64_t nv = encode_state(
                             npr, npb, d.turn, side_idx, nac, nff, diff_to_idx(ndiff));
                         if (mark(nv)) {
-                            g_states[static_cast<std::size_t>(layer_of(d.turn, side_idx, nac)) * kFreeN + nff]
+                            tls.buckets[static_cast<std::size_t>(layer_of(d.turn, side_idx, nac)) * kFreeN + nff]
                                 .push_back(nv);
                         }
                     };
@@ -298,7 +325,7 @@ int main(int argc, char** argv) {
                                 const std::uint64_t nv = encode_state(
                                     epr, epb, d.turn, 1, 0, d.free_flag, diff_to_idx(ediff));
                                 if (mark(nv)) {
-                                    g_states[static_cast<std::size_t>(layer_of(d.turn, 1, 0)) * kFreeN + d.free_flag]
+                                    tls.buckets[static_cast<std::size_t>(layer_of(d.turn, 1, 0)) * kFreeN + d.free_flag]
                                         .push_back(nv);
                                 }
                             } else {
@@ -311,7 +338,7 @@ int main(int argc, char** argv) {
                                             rpr, rpb, d.turn + 1, 0, 0, d.free_flag,
                                             diff_to_idx(ediff));
                                         if (mark(nv)) {
-                                            g_states[static_cast<std::size_t>(layer_of(d.turn + 1, 0, 0)) * kFreeN + d.free_flag]
+                                            tls.buckets[static_cast<std::size_t>(layer_of(d.turn + 1, 0, 0)) * kFreeN + d.free_flag]
                                                 .push_back(nv);
                                         }
                                     }
@@ -321,13 +348,25 @@ int main(int argc, char** argv) {
                     }
                 }
             }
+            // 层末合并：把各线程缓冲并入全局桶。
+            // 同层边（免费转向）流向更小的 ff，本层后面还会再处理到，顺序正确。
+            for (auto& tls : g_tls) {
+                for (std::size_t b = 0; b < tls.buckets.size(); ++b) {
+                    auto& dst = g_states[b];
+                    auto& src = tls.buckets[b];
+                    if (src.empty()) continue;
+                    dst.insert(dst.end(), src.begin(), src.end());
+                    src.clear();
+                }
+            }
+
             if (turn % 5 == 0 && rem == 0) {
-                std::printf("  turn %2d 累计 %lld\n", turn, total);
+                std::printf("  turn %2d 累计 %lld\n", turn, total.load());
                 std::fflush(stdout);
             }
         }
 
-        std::printf("  可达状态 %lld\n", total);
+        std::printf("  可达状态 %lld\n", total.load());
         std::fflush(stdout);
         // 访问位图不再需要，释放出 59 GB
         std::vector<std::uint64_t>().swap(g_seen);
