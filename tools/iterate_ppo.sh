@@ -25,6 +25,11 @@ GAMES=${GAMES:-4000}
 THREADS=${THREADS:-$(nproc)}
 EPOCHS=${EPOCHS:-4}
 TEMPERATURE=${TEMPERATURE:-1.0}
+# 设备与 minibatch。cluster34 有 V100，训练从分钟级降到秒级；
+# batch 必须保持小值——实测 batch=2048 时每轮只切出 4 次参数更新，
+# 近似 KL 只有 0.0009、clip 比例恒为 0，策略被冻住。
+DEVICE=${DEVICE:-cpu}
+BATCH=${BATCH:-128}
 
 OUT=build/ppo
 mkdir -p "$OUT"
@@ -48,7 +53,7 @@ for r in $(seq 1 "$ROUNDS"); do
 
     echo "--- [2/4] PPO 更新 $EPOCHS 轮 ---"
     python3 tools/train_ppo.py --data "$OUT/round$r.bin" --epochs "$EPOCHS" \
-        --threads 8 --out "$OUT/net_r$r.npz"
+        --batch "$BATCH" --device "$DEVICE" --threads 8 --out "$OUT/net_r$r.npz"
 
     echo "--- [3/4] 用新权重重编（下一轮采样要用它）---"
     make selfplay-ppo >/dev/null
