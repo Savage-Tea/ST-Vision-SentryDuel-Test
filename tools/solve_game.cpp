@@ -213,7 +213,11 @@ int main(int argc, char** argv) {
     std::fflush(stdout);
 
     {
+        std::printf("  [a] 分配访问位图 (%.1f GB)\n", static_cast<double>(kWords)*8/1073741824.0);
+        std::fflush(stdout);
         g_seen.assign(kWords, 0);
+        std::printf("  [b] 访问位图分配完成\n");
+        std::fflush(stdout);
         const int pr0 = encode_pose(init.red), pb0 = encode_pose(init.blue);
         const std::uint64_t start = encode_state(pr0, pb0, 0, 0, 0, 3, diff_to_idx(0));
         mark(start);
@@ -277,7 +281,11 @@ int main(int argc, char** argv) {
                         }
                     };
 
+                    std::printf("  [c] 处理状态 pr=%d pb=%d turn=%d side=%c ac=%d ff=%d diff=%d\n",
+                                d.pr, d.pb, d.turn, side, d.ac, d.free_flag, d.diff);
+                    std::fflush(stdout);
                     emit(sim::kMove, 0);
+                    std::printf("  [d] move 完成\n"); std::fflush(stdout);
                     emit(sim::kTurn, 'N');
                     emit(sim::kTurn, 'E');
                     emit(sim::kTurn, 'S');
@@ -285,6 +293,7 @@ int main(int argc, char** argv) {
                     emit(sim::kFire, 0);
                     emit(sim::kScan, 0);
 
+                    std::printf("  [e] 七个动作完成\n"); std::fflush(stdout);
                     // 收手：本阶段结束 —— 结算占点分，进入下一相位
                     {
                         sim::State es = s;
@@ -293,6 +302,7 @@ int main(int argc, char** argv) {
                         const int ediff =
                             d.diff + (es.sentry_for(side).score - before) * (side == 'R' ? 1 : -1);
                         const int epr = encode_pose(es.red), epb = encode_pose(es.blue);
+                        std::printf("  [f] 收手 epr=%d epb=%d\n", epr, epb); std::fflush(stdout);
                         if (epr >= 0 && epb >= 0) {
                             if (side == 'R') {
                                 const std::uint64_t nv = encode_state(
