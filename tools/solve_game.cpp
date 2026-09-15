@@ -213,11 +213,7 @@ int main(int argc, char** argv) {
     std::fflush(stdout);
 
     {
-        std::printf("  [a] 分配访问位图 (%.1f GB)\n", static_cast<double>(kWords)*8/1073741824.0);
-        std::fflush(stdout);
         g_seen.assign(kWords, 0);
-        std::printf("  [b] 访问位图分配完成\n");
-        std::fflush(stdout);
         const int pr0 = encode_pose(init.red), pb0 = encode_pose(init.blue);
         const std::uint64_t start = encode_state(pr0, pb0, 0, 0, 0, 3, diff_to_idx(0));
         mark(start);
@@ -273,19 +269,15 @@ int main(int argc, char** argv) {
                         const int nff = (nfr ? 2 : 0) | (nfb ? 1 : 0);
                         const int ndiff = d.diff + (hit ? (side == 'R' ? 2 : -2) : 0);
                         const int nac = used;
-                        const int nv = encode_state(npr, npb, d.turn, side_idx, nac, nff,
-                                                    diff_to_idx(ndiff));
+                        const std::uint64_t nv = encode_state(
+                            npr, npb, d.turn, side_idx, nac, nff, diff_to_idx(ndiff));
                         if (mark(nv)) {
                             g_states[static_cast<std::size_t>(layer_of(d.turn, side_idx, nac)) * kFreeN + nff]
                                 .push_back(nv);
                         }
                     };
 
-                    std::printf("  [c] 处理状态 pr=%d pb=%d turn=%d side=%c ac=%d ff=%d diff=%d\n",
-                                d.pr, d.pb, d.turn, side, d.ac, d.free_flag, d.diff);
-                    std::fflush(stdout);
                     emit(sim::kMove, 0);
-                    std::printf("  [d] move 完成\n"); std::fflush(stdout);
                     emit(sim::kTurn, 'N');
                     emit(sim::kTurn, 'E');
                     emit(sim::kTurn, 'S');
@@ -293,7 +285,6 @@ int main(int argc, char** argv) {
                     emit(sim::kFire, 0);
                     emit(sim::kScan, 0);
 
-                    std::printf("  [e] 七个动作完成\n"); std::fflush(stdout);
                     // 收手：本阶段结束 —— 结算占点分，进入下一相位
                     {
                         sim::State es = s;
@@ -302,7 +293,6 @@ int main(int argc, char** argv) {
                         const int ediff =
                             d.diff + (es.sentry_for(side).score - before) * (side == 'R' ? 1 : -1);
                         const int epr = encode_pose(es.red), epb = encode_pose(es.blue);
-                        std::printf("  [f] 收手 epr=%d epb=%d\n", epr, epb); std::fflush(stdout);
                         if (epr >= 0 && epb >= 0) {
                             if (side == 'R') {
                                 const std::uint64_t nv = encode_state(
@@ -351,7 +341,6 @@ int main(int argc, char** argv) {
     long long computed = 0;
 
     for (int layer = kLayers - 1; layer >= 0; --layer) {
-        const int turn = layer / (kSideN * kAcN);
         const int rem = layer % (kSideN * kAcN);
         const int side_idx = rem / kAcN;
         const int ac = rem % kAcN;
