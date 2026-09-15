@@ -49,9 +49,18 @@ FILES: list[tuple[str, str]] = [
     ("brain/belief_state.cpp", "brain/belief_state.cpp"),
     ("brain/net.h", "brain/net.h"),
     ("brain/net.cpp", "brain/net.cpp"),
-    # 训练产出的权重。没有它也能编译（会回退到手工评估），但那样传上去
-    # 等于没带模型 —— 所以打包时缺失应当报错，见 main() 的检查。
+    # —— 阶段③ 的策略网络路径（ST_POLICY=1；默认不启用，但 act.cpp 引用了
+    #    policy_forward 符号，清单不齐就是 dlopen 事故）——
+    ("brain/policy_net.h", "brain/policy_net.h"),
+    ("brain/policy_net.cpp", "brain/policy_net.cpp"),
+    ("obs/encode_v3.h", "obs/encode_v3.h"),
+    ("obs/encode_v3.cpp", "obs/encode_v3.cpp"),
+    ("sim/view_mirror.h", "sim/view_mirror.h"),
+    ("sim/view_mirror.cpp", "sim/view_mirror.cpp"),
+    # 训练产出的权重。net_weights.h 缺了会回退手工评估（等于没带模型）；
+    # policy_weights.h 支撑 ST_POLICY 路径。打包时缺失即报错。
     ("brain/net_weights.h", "brain/net_weights.h"),
+    ("brain/policy_weights.h", "brain/policy_weights.h"),
     ("tools/pack_Makefile", "Makefile"),
 ]
 

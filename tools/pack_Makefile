@@ -15,10 +15,11 @@ LDFLAGS  = -shared -Wl,-z,lazy -Wl,--allow-shlib-undefined \
            -L$(ENGINE_LIB_DIR) -lsentry_duel_engine
 
 SRC = my_ai.cpp \
-      sim/rules.cpp sim/belief.cpp \
+      sim/rules.cpp sim/belief.cpp sim/view_mirror.cpp \
       brain/eval.cpp brain/actions.cpp brain/search.cpp \
       brain/mcts.cpp brain/belief_state.cpp brain/net.cpp \
-      obs/encode.cpp
+      brain/policy_net.cpp \
+      obs/encode.cpp obs/encode_v3.cpp
 
 all: my_ai.so
 
