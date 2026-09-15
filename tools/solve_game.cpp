@@ -348,15 +348,18 @@ int main(int argc, char** argv) {
                     }
                 }
             }
-            // 层末合并：把各线程缓冲并入全局桶。
-            // 同层边（免费转向）流向更小的 ff，本层后面还会再处理到，顺序正确。
-            for (auto& tls : g_tls) {
-                for (std::size_t b = 0; b < tls.buckets.size(); ++b) {
-                    auto& dst = g_states[b];
-                    auto& src = tls.buckets[b];
-                    if (src.empty()) continue;
-                    dst.insert(dst.end(), src.begin(), src.end());
-                    src.clear();
+                // **每个 ff 之后都要合并**：同层边（免费转向）是 ff=3→1 这种
+                // 层内跨 ff 的转移。如果只在整层之后合并，处理 ff=2 时 ff=3 期间
+                // 发出的状态还躺在各线程缓冲里，会被整批漏掉——实测计数从
+                // 2726 万掉到 1343 万，正是这个原因。
+                for (auto& tls : g_tls) {
+                    for (std::size_t b = 0; b < tls.buckets.size(); ++b) {
+                        auto& dst = g_states[b];
+                        auto& src = tls.buckets[b];
+                        if (src.empty()) continue;
+                        dst.insert(dst.end(), src.begin(), src.end());
+                        src.clear();
+                    }
                 }
             }
 
