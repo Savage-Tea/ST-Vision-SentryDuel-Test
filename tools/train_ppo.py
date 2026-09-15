@@ -156,21 +156,20 @@ def main() -> int:
     print(f"  步数 中位 {int(np.median(lengths))} / 最大 {int(lengths.max())}")
     print(f"  奖励 非零步占比 {(rew != 0).mean() * 100:.2f}%   总和 {rew.sum():+.1f}")
 
-    net = Net().to(DEV)
-    opt = torch.optim.Adam(net.parameters(), lr=args.lr)
-    print(f"  参数量 {sum(p.numel() for p in net.parameters()):,}")
-
     # 设备。大 batch 下 NPU 的算子派发开销能被摊薄，小 batch 反而更慢，
     # 所以这里的 batch 与 device 要一起调。
     DEV = torch.device(args.device) if args.device == "cpu" else torch.device("npu:0")
     if args.device == "npu":
         import torch_npu  # noqa: F401
         print(f"  设备 npu:0  可用={torch.npu.is_available()} 卡数={torch.npu.device_count()}")
+    net = Net().to(DEV)
+    opt = torch.optim.Adam(net.parameters(), lr=args.lr)
+    print(f"  参数量 {sum(p.numel() for p in net.parameters()):,}")
+
     O = torch.from_numpy(obs).to(DEV)
     A = torch.from_numpy(act).to(DEV)
     R = torch.from_numpy(rew).to(DEV)
     M = torch.from_numpy(mask).to(DEV)
-    old_logp_all = old_logp_all.to(DEV) if False else None
 
     rng = np.random.default_rng(args.seed)
     n = len(t.seqs)
