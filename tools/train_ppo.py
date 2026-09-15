@@ -122,8 +122,8 @@ def main() -> int:
     ap.add_argument("--out", default="build/policy.npz")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--threads", type=int, default=8)
-    ap.add_argument("--device", default="cpu", choices=["cpu", "npu"],
-                    help="npu 需要先 source CANN 环境")
+    ap.add_argument("--device", default="cpu", choices=["cpu", "npu", "cuda"],
+                    help="npu 需要先 source CANN 环境；cuda 用于 cluster34 的 V100")
     ap.add_argument("--export-only", action="store_true")
     args = ap.parse_args()
 
@@ -158,10 +158,16 @@ def main() -> int:
 
     # 设备。大 batch 下 NPU 的算子派发开销能被摊薄，小 batch 反而更慢，
     # 所以这里的 batch 与 device 要一起调。
-    DEV = torch.device(args.device) if args.device == "cpu" else torch.device("npu:0")
     if args.device == "npu":
+        DEV = torch.device("npu:0")
         import torch_npu  # noqa: F401
         print(f"  设备 npu:0  可用={torch.npu.is_available()} 卡数={torch.npu.device_count()}")
+    elif args.device == "cuda":
+        DEV = torch.device("cuda:0")
+        print(f"  设备 {torch.cuda.get_device_name(0)}  显存 "
+              f"{torch.cuda.get_device_properties(0).total_memory/1073741824:.0f} GB")
+    else:
+        DEV = torch.device("cpu")
     net = Net().to(DEV)
     opt = torch.optim.Adam(net.parameters(), lr=args.lr)
     print(f"  参数量 {sum(p.numel() for p in net.parameters()):,}")
