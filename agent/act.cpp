@@ -79,6 +79,11 @@ const bool g_use_policy = env_flag("ST_POLICY");
 // 而冒进。实验用 ST_OPP_WINDOW=1 开启（且仅执蓝生效，蓝方窗口收益大）。
 const bool g_opp_window = env_flag("ST_OPP_WINDOW");
 
+// 值蒸馏叶评估（阶段③ → phase① 的成果回接）。ST_VALUE_NET=1 启用。
+double env_double(const char* name, double fallback); // 定义见下方
+const bool g_use_value_net = env_flag("ST_VALUE_NET");
+const double g_value_scale = env_double("ST_VALUE_SCALE", 30.0);
+
 double env_double(const char* name, double fallback); // 定义见下方
 
 brain::MctsConfig load_mcts_config() {
@@ -272,6 +277,8 @@ void run(const Board& board, char my_color) {
         // 唯一一处"按颜色分支"——它不是坐标分支（坐标已由镜像抹平），
         // 而是引擎结算顺序本身的不对称（CD 只在蓝方阶段后递减）。
         in.acts_first_world = (my_color == 'R');
+        in.use_value_net = g_use_value_net;
+        in.value_scale = g_value_scale;
 
         brain::SearchStats stats;
         brain::Plan plan;

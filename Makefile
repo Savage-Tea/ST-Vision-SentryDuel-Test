@@ -61,7 +61,8 @@ $(BUILD)/opponents/det_ai_%.so: $(SENTRY_DUEL_ROOT)/engine/tests/det_ai_%.cpp
 # —— 我们的 AI（阶段①：搜索 + policy model）——
 AI_SRC := agent/act.cpp brain/eval.cpp brain/actions.cpp brain/search.cpp \
           brain/mcts.cpp brain/belief_state.cpp brain/net.cpp \
-          brain/policy_net.cpp obs/encode.cpp obs/encode_v3.cpp \
+          brain/policy_net.cpp brain/value_net.cpp \
+          obs/encode.cpp obs/encode_v3.cpp \
           sim/view_mirror.cpp sim/rules.cpp sim/belief.cpp
 
 $(BUILD)/my_ai.so: $(AI_SRC) $(HDRS) | engine

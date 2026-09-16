@@ -46,6 +46,11 @@ struct TurnInput {
     // 递减只发生在蓝方阶段后，火炮未就绪时的暴露代价红蓝不对称（2 窗口 vs
     // 1 窗口）——评估需要知道这一项。见 eval.h 的 w_danger_red_scale。
     bool acts_first_world = true;
+    // 值蒸馏网络（ST_VALUE_NET=1 启用）：叶评估替换为 V* 蒸馏网络的输出。
+    // 网络不可用时自动回退手工评估。scale 把 [-1,1] 的值映射到与终局
+    // 奖励可比的量级（终局 ±1e6，手工评估 ±10s）。
+    bool use_value_net = false;
+    double value_scale = 30.0;
     // 对手"刚刚开过火、正处在 CD 无力期"的推断：被击中时，打我们的人必然
     // 刚开火。引擎不暴露对手 CD（观测恒 -1，默认保守假设随时可开火），
     // 但这次击中本身泄露了信息。窗口按 CD 时序不对称折算：

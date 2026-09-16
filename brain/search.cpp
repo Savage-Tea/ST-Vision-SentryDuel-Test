@@ -1,5 +1,7 @@
 #include "brain/search.h"
 
+#include "brain/value_net.h"
+
 #include <algorithm>
 #include <vector>
 
@@ -15,11 +17,40 @@ struct Leaf {
 
 // 候选生成与额度语义已抽到 brain/actions.*，与 MCTS 共用一份实现
 
+// 叶评估：值蒸馏网络启用时用 V* 网络替换手工评估。
+//
+// 叶的相位语义（与求解器状态一一对应）：
+//   after = "我方"阶段已结束（占点分已入账）→ 对手行动中 → 红方行动中
+//   当且仅当我方是世界红方；反之红方行动中 = 我方。
+// free 旗标在搜索里没有完整跟踪，用出生点近似（只在免费转向上有差，
+// 且只影响免费转向这种小代价动作——对值的影响是二阶的）。
+double leaf_eval(const sim::State& after, const sim::Belief& b, const Weights& w,
+                 bool acts_first, bool use_vnet, double vscale, int used,
+                 bool my_free_left) {
+    if (use_vnet && brain::value_net_available()) {
+        float feats[brain::kValueObsDim];
+        const bool swap = !acts_first; // 我执蓝 → 世界红方在 s.blue
+        const bool red_to_move = swap; // after = 局部红已收尾 → 局部蓝行动中；
+                                       // 世界红行动中 ⟺ 我执蓝
+        const bool world_free_red = swap ? my_free_left
+                                         : sim::is_at_spawn(after, 'B');
+        const bool world_free_blue = swap ? sim::is_at_spawn(after, 'R')
+                                          : my_free_left;
+        brain::value_features(after, red_to_move, world_free_red, world_free_blue,
+                              swap, feats);
+        float v = 0.0f;
+        brain::value_eval(feats, &v);
+        return static_cast<double>(acts_first ? v : -v) * vscale
+               - w.w_waste * static_cast<double>(used);
+    }
+    return evaluate(after, w, b, acts_first) - w.w_waste * static_cast<double>(used);
+}
+
 // 我方第一层：枚举 0..3 个行动，每个深度都作为候选方案记录下来
 void dfs_our(const sim::State& s, const sim::Belief& b, int used, bool free_turn,
              bool enemy_visible, int depth, Plan& cur, std::vector<Leaf>& out,
              const Deadline& dl, SearchStats& st, const Weights& w, bool acts_first,
-             const TurnInput* bans) {
+             bool use_vnet, double vscale, const TurnInput* bans) {
     {
         // 我方行动阶段结束 → 本回合占点分入账
         sim::State after = s;
@@ -28,7 +59,8 @@ void dfs_our(const sim::State& s, const sim::Belief& b, int used, bool free_turn
         leaf.plan = cur;
         leaf.plan.count = depth;
         // 行动是有限资源：同等局面下优先选消耗更少的方案（仅用于打破平局）
-        leaf.value = evaluate(after, w, b, acts_first) - w.w_waste * static_cast<double>(used);
+        leaf.value = leaf_eval(after, b, w, acts_first, use_vnet, vscale, used,
+                               free_turn);
         leaf.state = after;
         leaf.belief = b;
         leaf.plan.valid = true;
@@ -61,18 +93,20 @@ void dfs_our(const sim::State& s, const sim::Belief& b, int used, bool free_turn
         cur.actions[depth] = c.action;
         cur.args[depth] = c.arg;
         dfs_our(ns, nb, nused, nfree, enemy_visible, depth + 1, cur, out, dl, st, w,
-                acts_first, bans);
+                acts_first, use_vnet, vscale, bans);
     }
 }
 
 // 对手第二层：枚举 0..3 个行动，取让我们最不利的（minimize）
 void dfs_opp(const sim::State& s, const sim::Belief& b, int used, bool free_turn,
              bool sees_us, int depth, double& worst, const Deadline& dl,
-             SearchStats& st, const Weights& w, bool acts_first) {
+             SearchStats& st, const Weights& w, bool acts_first, bool use_vnet,
+             double vscale) {
     {
         sim::State after = s;
         sim::end_side_turn(after, 'B');
-        worst = std::min(worst, evaluate(after, w, b, acts_first));
+        worst = std::min(worst, leaf_eval(after, b, w, acts_first, use_vnet, vscale,
+                                          used, free_turn));
         ++st.opp_nodes;
     }
 
@@ -89,14 +123,15 @@ void dfs_opp(const sim::State& s, const sim::Belief& b, int used, bool free_turn
         int nused = used;
         bool nfree = free_turn;
         if (!apply_step(ns, 'B', c, nused, nfree)) continue;
-        dfs_opp(ns, b, nused, nfree, sees_us, depth + 1, worst, dl, st, w, acts_first);
+        dfs_opp(ns, b, nused, nfree, sees_us, depth + 1, worst, dl, st, w, acts_first,
+                use_vnet, vscale);
     }
 }
 
 // 对手在我方叶子状态上的最优回应值
 double opponent_best(const sim::State& s, const sim::Belief& b, const Weights& w,
-                     bool acts_first, int opp_def_until, const Deadline& dl,
-                     SearchStats& st) {
+                     bool acts_first, bool use_vnet, double vscale,
+                     int opp_def_until, const Deadline& dl, SearchStats& st) {
     sim::State base = s;
     // 对手的 CD 在观测里恒为 -1（引擎不暴露），保守假设其随时可开火；
     // 唯一例外是被击中推断出的无力窗口——那是对手刚开火的确定性情报，
@@ -109,9 +144,10 @@ double opponent_best(const sim::State& s, const sim::Belief& b, const Weights& w
     // 对手能否看见我们：这是确定可算的，决定了他能否开火
     const bool opp_sees_us = sim::can_see(base.blue, base.red.last_known_pos, base.obstacles);
 
-    double worst = evaluate(base, w, b, acts_first);
     const bool free_turn = sim::is_at_spawn(base, 'B');
-    dfs_opp(base, b, 0, free_turn, opp_sees_us, 0, worst, dl, st, w, acts_first);
+    double worst = leaf_eval(base, b, w, acts_first, use_vnet, vscale, 0, free_turn);
+    dfs_opp(base, b, 0, free_turn, opp_sees_us, 0, worst, dl, st, w, acts_first,
+            use_vnet, vscale);
     return worst;
 }
 
@@ -123,7 +159,8 @@ Plan search_turn(const TurnInput& in, const Weights& w, const Deadline& deadline
     std::vector<Leaf> leaves;
     Plan cur;
     dfs_our(in.state, in.belief, in.used_by_now, in.free_turn_available, in.enemy_visible,
-            0, cur, leaves, deadline, st, w, in.acts_first_world, &in);
+            0, cur, leaves, deadline, st, w, in.acts_first_world, in.use_value_net,
+            in.value_scale, &in);
 
     if (leaves.empty()) {
         if (stats) *stats = st;
@@ -144,6 +181,7 @@ Plan search_turn(const TurnInput& in, const Weights& w, const Deadline& deadline
         }
         leaves[i].value =
             opponent_best(leaves[i].state, leaves[i].belief, w, in.acts_first_world,
+                          in.use_value_net, in.value_scale,
                           in.opp_defenseless_until, deadline, st);
         ++refined;
     }
