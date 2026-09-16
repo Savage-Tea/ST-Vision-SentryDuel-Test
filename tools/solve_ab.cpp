@@ -518,6 +518,8 @@ int main(int argc, char** argv) {
     const char* teacher_prefix = nullptr;
     int teacher_games = 4000;
     double teacher_eps = 0.3;
+    const char* dump_values_path = nullptr;
+    long dump_values_n = 8000000;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--from-turn") == 0 && i + 1 < argc) {
             from_turn = std::atoi(argv[++i]);
@@ -529,6 +531,10 @@ int main(int argc, char** argv) {
             teacher_games = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--eps") == 0 && i + 1 < argc) {
             teacher_eps = std::atof(argv[++i]);
+        } else if (std::strcmp(argv[i], "--dump-values") == 0 && i + 1 < argc) {
+            dump_values_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--dump-n") == 0 && i + 1 < argc) {
+            dump_values_n = std::atoll(argv[++i]);
         }
     }
     g_max_turn = 25;
@@ -544,6 +550,68 @@ int main(int argc, char** argv) {
     // 从 turn=N 开始时比分未知 —— 这里取 0:0。
     // 所以 --from-turn 测的是"从该回合 0:0 开始"的子博弈，用于量搜索规模。
     const int v = search(init, 'R', 0, true, true, 0, kLose, kWin, kTurnN - from_turn);
+
+    // —— 值蒸馏采样：从 TT 里抽 kExact 条目写 (状态字段, V*) ——
+    //
+    // 键本身就是状态（pr,pb,turn,side,ac,freef,diff），解出来就是特征。
+    // 只采 kExact（真值）；kLower/kUpper 是 αβ 窗口边界，做回归会引入偏差。
+    // 蓄水池采样固定条数，避免对遍历顺序敏感。
+    if (dump_values_path != nullptr) {
+        std::printf("\n值采样: 目标 %ld 条 kExact → %s\n", dump_values_n, dump_values_path);
+        std::fflush(stdout);
+        std::FILE* fv = std::fopen(dump_values_path, "wb");
+        if (fv == nullptr) {
+            std::fprintf(stderr, "值采样: 打不开输出 %s\n", dump_values_path);
+            return 1;
+        }
+        std::mt19937_64 vrng(20260917ull);
+        long long seen_exact = 0, seen_total = 0, written = 0;
+        // 可采 = kExact，或"饱和边界"（三值域上等价于真值）：
+        //   kLower 且 v=+1  => 红胜（下界已到顶）
+        //   kUpper 且 v=-1  => 红负（上界已到底）
+        auto harvestable = [](const Entry& e) {
+            return e.flag == 0 || (e.flag == 1 && e.value == 1) ||
+                   (e.flag == 2 && e.value == -1);
+        };
+        for (const auto& kv : g_tt) {
+            ++seen_total;
+            if (harvestable(kv.second)) ++seen_exact;
+        }
+        long long stride_seen = 0;
+        for (const auto& kv : g_tt) {
+            if (!harvestable(kv.second)) continue;
+            ++stride_seen;
+            // 系统采样：每 seen_exact/dump_n 个取 1 个，加随机起点相位
+            const long long stride = seen_exact / dump_values_n + 1;
+            if ((stride_seen + vrng() % stride) % stride != 0) continue;
+            std::uint64_t t = kv.first;
+            const int dd = static_cast<int>(t % kDiffN) - kDiffMax; t /= kDiffN;
+            const int ff = static_cast<int>(t % 4); t /= 4;
+            const int acx = static_cast<int>(t % 4); t /= 4;
+            const int sidx = static_cast<int>(t % 2); t /= 2;
+            const int tn = static_cast<int>(t % kTurnN);
+            const int pair = static_cast<int>(t / kTurnN);
+            const int pr = pair / kPoses, pb = pair % kPoses;
+            unsigned char rec[10] = {
+                static_cast<unsigned char>(pr & 0xFF),
+                static_cast<unsigned char>((pr >> 8) & 0xFF),
+                static_cast<unsigned char>(pb & 0xFF),
+                static_cast<unsigned char>((pb >> 8) & 0xFF),
+                static_cast<unsigned char>(tn),
+                static_cast<unsigned char>(sidx),
+                static_cast<unsigned char>(acx),
+                static_cast<unsigned char>(ff),
+                static_cast<unsigned char>(dd + kDiffMax),
+                static_cast<unsigned char>(kv.second.value + 1), // -1..1 -> 0..2
+            };
+            std::fwrite(rec, 1, 10, fv);
+            ++written;
+        }
+        std::fclose(fv);
+        std::printf("  值采样完成: exact %lld / 总 %lld, 写出 %ld 条\n",
+                    seen_exact, seen_total, written);
+        std::fflush(stdout);
+    }
 
     // —— teacher 模式：求解完成后直接产出蒸馏数据 ——
     if (teacher_prefix != nullptr) {
