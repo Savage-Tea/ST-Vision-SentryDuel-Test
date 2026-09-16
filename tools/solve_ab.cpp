@@ -179,29 +179,6 @@ int search(const sim::State& s0, char side, int ac, bool free_r, bool free_b, in
     }
 
     ++g_nodes;
-    if (g_nodes % 20000000 == 0) {
-        std::fprintf(stderr, "[search] nodes=%lld tt=%zu\n", g_nodes, g_tt.size());
-        // 解码抽样：看新键都落在哪些字段上
-        int hist_turn[26] = {}, hist_diff_out = 0, hist_ac[4] = {}, hist_ff[4] = {};
-        for (const auto& kv : g_tt) {
-            std::uint64_t t = kv.first;
-            const int dd = static_cast<int>(t % kDiffN) - kDiffMax; t /= kDiffN;
-            const int ff = static_cast<int>(t % 4); t /= 4;
-            const int acx = static_cast<int>(t % 4); t /= 4;
-            const int sidx = static_cast<int>(t % 2); t /= 2;
-            const int tn = static_cast<int>(t % kTurnN);
-            if (tn < 26) ++hist_turn[tn];
-            if (dd < -kDiffMax || dd > kDiffMax) ++hist_diff_out;
-            ++hist_ac[acx & 3]; ++hist_ff[ff & 3];
-        }
-        std::fprintf(stderr, "  turn 分布: ");
-        for (int i = 0; i < 26; ++i) if (hist_turn[i]) std::fprintf(stderr, "%d:%d ", i, hist_turn[i]);
-        std::fprintf(stderr, "\n  ac: %d/%d/%d/%d  ff: %d/%d/%d/%d  diff越界: %d\n",
-                     hist_ac[0], hist_ac[1], hist_ac[2], hist_ac[3],
-                     hist_ff[0], hist_ff[1], hist_ff[2], hist_ff[3], hist_diff_out);
-        std::fflush(stderr);
-    }
-
     const int alpha0 = alpha, beta0 = beta;
     int best = (side == 'R') ? kLose : kWin; // 红方取最大，蓝方取最小
     int best_move = 255;
@@ -297,97 +274,39 @@ struct Seq {
     std::vector<std::uint8_t> action;
 };
 
-// 查一个后继的值：优先直读置换表（命中则 O(1)），缺失则用全窗口搜一遍
-// （搜完会入库，下次即命中）。
-int child_value(const sim::State& ns, char next_side, int nac, bool nfr, bool nfb,
-                int nv, int turn_next) {
-    const int pr = encode_pose(ns.red), pb = encode_pose(ns.blue);
-    if (pr < 0 || pb < 0) return (next_side == 'R') ? kLose : kWin;
-    const int side_idx = (next_side == 'R') ? 0 : 1;
-    const int freef = (nfr ? 2 : 0) | (nfb ? 1 : 0);
-    // make_key 内部已经 +kDiffMax，这里传原始 diff——上一版多加了一次，
-    // 键永远对不上，快速查表路径形同虚设，每个后继都退化成全窗搜索。
+// O(1) 教师查询：主求解时每个访问过的节点都存了 Entry.best（当时的最优手）。
+// gen_moves 的顺序只依赖朝向，同一状态重建的动作表一致，下标可直接复用。
+// 返回 -1 表示"冷状态"（主求解没访问过 / 无可用 best）——没有精确标签。
+int warm_action(const sim::State& world, char side, int ac, bool fr, bool fb, int diff) {
+    const int pr = encode_pose(world.red), pb = encode_pose(world.blue);
+    if (pr < 0 || pb < 0) return -1;
+    const int side_idx = (side == 'R') ? 0 : 1;
+    const int freef = (fr ? 2 : 0) | (fb ? 1 : 0);
     const std::uint64_t key =
-        make_key(pr, pb, turn_next, side_idx, nac, freef, nv);
+        make_key(pr, pb, world.turn, side_idx, ac, freef, diff);
     const auto it = g_tt.find(key);
-    if (it != g_tt.end()) return it->second.value;
-    return search(ns, next_side, nac, nfr, nfb, nv, kLose, kWin, 0);
-}
-
-// 教师在当前局面选动作，返回 (动作下标 0..7, 是否收手)
-int teacher_action(const sim::State& world, char side, int ac, bool fr, bool fb,
-                   int diff, std::mt19937& rng, double eps) {
+    if (it == g_tt.end()) return -1;
+    if (it->second.best == 255) return -1;
+    if (it->second.best == 254) return 7; // 收手
+    // 还原成动作下标：solve 时的动作表 = move + 3个转向 + fire + scan
+    //（按当时朝向剔除同向转向）。直接用 cand_to_index 反查。
     std::vector<Move> mv;
     gen_moves(world, side, mv);
-
-    // ε 探索：在合法动作里均匀抽一个（收手也算）
-    if (std::uniform_real_distribution<double>(0, 1)(rng) < eps) {
-        const int n = static_cast<int>(mv.size()) + 1;
-        const int k = std::uniform_int_distribution<int>(0, n - 1)(rng);
-        return k == static_cast<int>(mv.size()) ? 7 : brain::cand_to_index({mv[k].action, mv[k].arg});
-    }
-
-    int best_idx = 7;
-    int best_val = (side == 'R') ? 2 : -2;
-    auto consider = [&](const sim::State& ns, char next_side, int nac, bool nfr2,
-                        bool nfb2, int nv, int turn_next, int idx) {
-        const int v = child_value(ns, next_side, nac, nfr2, nfb2, nv, turn_next);
-        if (side == 'R' ? (v > best_val) : (v < best_val)) {
-            best_val = v;
-            best_idx = idx;
-        }
-    };
-
-    // 收手
-    {
-        sim::State es = world;
-        const int before = es.sentry_for(side).score;
-        sim::end_side_turn(es, side);
-        const int ediff = diff + (es.sentry_for(side).score - before) * (side == 'R' ? 1 : -1);
-        if (side == 'R') {
-            consider(es, 'B', 0, fr, fb, ediff, es.turn, 7);
-        } else if (world.turn + 1 < kTurnN) {
-            sim::State rs = es;
-            sim::end_round(rs);
-            consider(rs, 'R', 0, fr, fb, ediff, rs.turn, 7);
-        } else {
-            const int v = terminal_value(ediff);
-            if (side == 'R' ? (v > best_val) : (v < best_val)) best_idx = 7;
-        }
-    }
-    for (std::size_t i = 0; i < mv.size(); ++i) {
-        sim::State ns = world;
-        int used = ac;
-        bool ft = (side == 'R') ? fr : fb;
-        bool hit = false;
-        const brain::Cand wc = brain::local_to_world({mv[i].action, mv[i].arg}, side);
-        if (!brain::apply_step(ns, side, wc, used, ft, &hit)) continue;
-        const int nv = diff + (hit ? (side == 'R' ? 2 : -2) : 0);
-        bool nfr = (side == 'R') ? ft : fr;
-        bool nfb = (side == 'B') ? ft : fb;
-        if (hit) {
-            if (side == 'R') nfb = true; else nfr = true;
-        }
-        consider(ns, side, used, nfr, nfb, nv, ns.turn, brain::cand_to_index({mv[i].action, mv[i].arg}));
-    }
-    return best_idx;
+    if (it->second.best >= static_cast<int>(mv.size())) return -1;
+    return brain::cand_to_index({mv[it->second.best].action, mv[it->second.best].arg});
 }
 
-// 跑一局教师自对弈，产出两条（部分信息观测，教师标签）序列
+// 跑一局：教师路径读 e.best，ε 或冷状态随机走（冷步不写数据——没有精确标签）。
 void play_teacher_game(std::mt19937& rng, double eps, int from_turn,
                        Seq& seq_r, Seq& seq_b) {
     sim::State world = sim::make_initial_state();
-    world.turn = from_turn;  // 【关键】与主求解同一起点。上一版漏了这行，
-                             // 教师从 turn 0 开始下，第一步查询就在搜整棵
-                             // 完整博弈——15 分钟一局都跑不完的真正原因。
+    world.turn = from_turn;
     sim::ViewMirror mirror;
     mirror.reset();
     seq_r.obs.clear(); seq_r.action.clear();
     seq_b.obs.clear(); seq_b.action.clear();
 
     bool respawn_pending[2] = {true, true};
-    // 双方"当前是否还有免费转向"——教师查表的键里包含这两个旗标，
-    // 必须按引擎语义维护（apply_step 会消耗它），否则键错、命中率崩。
     bool side_free[2] = {true, true};
     Seq* seq[2] = {&seq_r, &seq_b};
 
@@ -401,27 +320,51 @@ void play_teacher_game(std::mt19937& rng, double eps, int from_turn,
             int used = 0;
 
             for (int k = 0; k < brain::kMaxActionsPerTurn; ++k) {
-                // 学生观测：部分信息
                 const sim::State view = mirror.local_view(world, side);
                 float obs[obs::kObsDimV3];
                 obs::encode_v3(view, mirror.enemy_visible(side), used, ft, obs);
 
                 const int diff = world.red.score - world.blue.score;
-                int a = teacher_action(world, side, used,
-                                       side_free[0], side_free[1], diff, rng, eps);
+                int warm = warm_action(world, side, used,
+                                       side_free[0], side_free[1], diff);
+                const bool cold = warm < 0;
+                std::vector<Move> mv;
+                if (cold) gen_moves(world, side, mv);
+                const int n_choices =
+                    cold ? static_cast<int>(mv.size()) + 1 : brain::kActionDim;
+
+                int exec;
+                if (cold || std::uniform_real_distribution<double>(0, 1)(rng) < eps) {
+                    // 随机执行；冷状态没有标签，跳过记录
+                    const int kk = std::uniform_int_distribution<int>(0, n_choices - 1)(rng);
+                    exec = cold
+                        ? (kk == static_cast<int>(mv.size()) ? 7
+                          : brain::cand_to_index({mv[kk].action, mv[kk].arg}))
+                        : kk;
+                    if (cold) {
+                        // 执行随机动作但不写样本
+                        if (exec == 7) break;
+                        const brain::Cand wc2 =
+                            brain::local_to_world(brain::index_to_cand(exec), side);
+                        bool hit2 = false;
+                        if (!brain::apply_step(world, side, wc2, used, ft, &hit2)) continue;
+                        side_free[si] = ft;
+                        if (hit2) { respawn_pending[1 - si] = true; side_free[1 - si] = true; }
+                        mirror.after_action(world, side, wc2.action);
+                        if (used >= brain::kMaxActionsPerTurn) break;
+                        continue;
+                    }
+                } else {
+                    exec = warm;
+                }
 
                 Seq& out = *seq[si];
                 out.obs.insert(out.obs.end(), obs, obs + obs::kObsDimV3);
-                out.action.push_back(static_cast<std::uint8_t>(a));
-                if (getenv("TEACHER_TRACE") != nullptr) {
-                    std::fprintf(stderr, "[step] g=0 side=%c k=%d used=%d turn=%d "
-                                 "nodes=%lld tt=%zu\n", side, k, used, world.turn,
-                                 g_nodes, g_tt.size());
-                }
-                // reward 恒 0：BC 不用（SDPP 布局保留字段）
-                // 执行动作（ε 时执行的可能不是教师最优——标签仍是最优）
-                if (a == 7) break; // 收手
-                const brain::Cand wc = brain::local_to_world(brain::index_to_cand(a), side);
+                out.action.push_back(static_cast<std::uint8_t>(warm < 0 ? exec : warm));
+
+                if (exec == 7) break;
+                const brain::Cand wc =
+                    brain::local_to_world(brain::index_to_cand(exec), side);
                 bool hit = false;
                 if (!brain::apply_step(world, side, wc, used, ft, &hit)) continue;
                 side_free[si] = ft;
@@ -447,7 +390,8 @@ void run(const std::string& prefix, int games, double eps, int from_turn) {
         std::exit(1);
     }
     const char magic[4] = {'S', 'D', 'P', 'P'};
-    const std::uint32_t version = 1, obs_dim = obs::kObsDimV3, act_dim = static_cast<std::uint32_t>(brain::kActionDim);
+    const std::uint32_t version = 1, obs_dim = obs::kObsDimV3;
+    const std::uint32_t act_dim = static_cast<std::uint32_t>(brain::kActionDim);
     const std::uint32_t g32 = static_cast<std::uint32_t>(games);
     std::fwrite(magic, 1, 4, f);
     std::fwrite(&version, sizeof(version), 1, f);
@@ -457,6 +401,91 @@ void run(const std::string& prefix, int games, double eps, int from_turn) {
 
     std::mt19937 rng(20260916u);
     const auto t0 = std::chrono::steady_clock::now();
+
+    // —— e.best 质量抽检 ——
+    // Entry.best 是 αβ 窗口下记的最优手，对被剪枝的节点可能不是全局最优。
+    // 抽样：枚举子节点、直读子节点 TT 值算 argmax，与存的 best 比对。
+    {
+        std::vector<std::uint64_t> sample;
+        for (const auto& kv : g_tt) {
+            if (kv.second.best != 255) sample.push_back(kv.first);
+            if (sample.size() >= 500) break;
+        }
+        int agree = 0, total = 0;
+        for (const std::uint64_t key : sample) {
+            std::uint64_t t = key;
+            const int diff = static_cast<int>(t % kDiffN) - kDiffMax; t /= kDiffN;
+            const int ff = static_cast<int>(t % 4); t /= 4;
+            const int ac = static_cast<int>(t % 4); t /= 4;
+            const int sidx = static_cast<int>(t % 2); t /= 2;
+            const int tn = static_cast<int>(t % kTurnN);
+            const int pair = static_cast<int>(t / kTurnN);
+            const int pr = pair / kPoses, pb = pair % kPoses;
+            if (terminal_of(tn, diff)) continue;
+
+            sim::State s0 = sim::make_initial_state();
+            apply_pose(pr, s0.red);
+            apply_pose(pb, s0.blue);
+            s0.turn = tn;
+            const char side = sidx == 0 ? 'R' : 'B';
+            const bool free_r = (ff & 2) != 0, free_b = (ff & 1) != 0;
+            const bool ft = (side == 'R') ? free_r : free_b;
+
+            std::vector<Move> mv;
+            gen_moves(s0, side, mv);
+            int best_v = (side == 'R') ? 2 : -2, best_i = 254;
+            auto consider = [&](const sim::State& ns, char nsd, int nac, bool nr,
+                                bool nb2, int nv, int tn2, int idx) {
+                const int p2r = encode_pose(ns.red), p2b = encode_pose(ns.blue);
+                if (p2r < 0 || p2b < 0) return;
+                const std::uint64_t k2 = make_key(p2r, p2b, tn2, nsd == 'R' ? 0 : 1,
+                                                  nac, (nr ? 2 : 0) | (nb2 ? 1 : 0), nv);
+                const auto it2 = g_tt.find(k2);
+                if (it2 == g_tt.end()) return;
+                const int v = it2->second.value;
+                if (side == 'R' ? (v > best_v) : (v < best_v)) {
+                    best_v = v;
+                    best_i = static_cast<int>(idx);
+                }
+            };
+            {
+                sim::State es = s0;
+                const int before = es.sentry_for(side).score;
+                sim::end_side_turn(es, side);
+                const int ed = diff + (es.sentry_for(side).score - before) * (side == 'R' ? 1 : -1);
+                if (side == 'R') consider(es, 'B', 0, free_r, free_b, ed, es.turn, 254);
+                else if (tn + 1 < kTurnN) {
+                    sim::State rs = es;
+                    sim::end_round(rs);
+                    consider(rs, 'R', 0, free_r, free_b, ed, rs.turn, 254);
+                }
+            }
+            for (std::size_t i = 0; i < mv.size(); ++i) {
+                sim::State ns = s0;
+                int used = ac;
+                bool f2 = ft;
+                bool hit = false;
+                const brain::Cand wc = brain::local_to_world({mv[i].action, mv[i].arg}, side);
+                if (!brain::apply_step(ns, side, wc, used, f2, &hit)) continue;
+                const int nv = diff + (hit ? (side == 'R' ? 2 : -2) : 0);
+                bool nr = (side == 'R') ? f2 : free_r;
+                bool nb2 = (side == 'B') ? f2 : free_b;
+                if (hit) { if (side == 'R') nb2 = true; else nr = true; }
+                consider(ns, side, used, nr, nb2, nv, ns.turn, i);
+            }
+            // best_i 是 mv 下标或 254（收手）；映射到与 Entry.best 同一空间
+            const int stored = g_tt[key].best;
+            const int mine = best_i;
+            ++total;
+            if (stored == mine || (stored == 254 && mine == 254)) ++agree;
+            else if (stored < static_cast<int>(mv.size()) && mine < static_cast<int>(mv.size()) &&
+                     mv[stored].action == mv[mine].action && mv[stored].arg == mv[mine].arg) ++agree;
+        }
+        std::printf("  e.best 抽检: %d/%d 一致 (%.1f%%)\n", agree, total,
+                    total ? 100.0 * agree / total : 0.0);
+        std::fflush(stdout);
+    }
+
     for (int g = 0; g < games; ++g) {
         Seq r, b;
         play_teacher_game(rng, eps, from_turn, r, b);
@@ -470,18 +499,18 @@ void run(const std::string& prefix, int games, double eps, int from_turn) {
                 std::fwrite(&zero, sizeof(zero), 1, f);
             }
         }
-        if ((g + 1) % 10 == 0 || games <= 20) {
-            std::printf("  teacher %d/%d 局  (TT %zu, 节点 %lld)\n",
-                        g + 1, games, g_tt.size(), g_nodes);
+        if ((g + 1) % 200 == 0 || games <= 20) {
+            std::printf("  teacher %d/%d 局\n", g + 1, games);
             std::fflush(stdout);
         }
     }
     std::fclose(f);
-    const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    const double secs =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     std::printf("  teacher 完成: %d 局, %.1f 秒\n", games, secs);
 }
 
-} // namespace teacher
+} // namespace teacher} // namespace teacher
 
 int main(int argc, char** argv) {
     int from_turn = 0;
