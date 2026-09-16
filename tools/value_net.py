@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """value_net.py —— 值蒸馏网络的定义与导出（与 tools/policy_net.py 平行）
 
-特征契约（116 维）必须与 brain/value_net.h 的注释及 value_features 实现
-严格一致：
-  平面 0：红方位置 one-hot (49)
-  平面 1：蓝方位置 one-hot (49)
-  标量（18）：红朝向 one-hot(4)、蓝朝向 one-hot(4)、红 fcd/2、蓝 fcd/2、
-              红 scd/3、蓝 scd/3、turn/25、红方行动中(1)、ac/3（恒 0，
-              部署查询点都在相位边界上）、free_red、free_blue、diff_red/51
-输出：V_red ∈ [-1,1]，线性。
+特征契约 v2（110 维，信徒相对 + 信念平面）必须与 brain/value_net.h 严格一致：
+  平面 0：我方位置 one-hot (49)
+  平面 1：信念平面 (49)
+  标量（12）：我方朝向 one-hot(4)、我方 fcd/2、我方 scd/3、turn/25、
+              我方行动中(1)、ac/3（恒 0）、我方免费(1)、对手免费(1)、
+              diff_mine/51
+输出：我方视角期望博弈值 ∈ [-1,1]，线性。
 """
 from __future__ import annotations
 
@@ -22,7 +21,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-IN_DIM = 116
+IN_DIM = 110
 H1 = 256
 H2 = 256
 
@@ -56,46 +55,41 @@ class ValueNet(nn.Module):
 
 
 def build_features(rec: np.ndarray) -> np.ndarray:
-    """把 solve_ab --dump-values 的原始记录 (N,10) 转成特征矩阵 (N,116)。
+    """把 --dump-values v2 的 20 字节记录 (N,20) 转成特征 (N,110)。
 
-    布局必须与 brain/value_net.cpp 的 value_features 一致。
+    布局必须与 brain/value_net.cpp 的 value_features 一致（v2 契约）。
     """
     N = rec.shape[0]
-    pr = rec[:, 0].astype(np.int64) | (rec[:, 1].astype(np.int64) << 8)
-    pb = rec[:, 2].astype(np.int64) | (rec[:, 3].astype(np.int64) << 8)
-    turn = rec[:, 4].astype(np.float32)
-    side = rec[:, 5].astype(np.float32)
-    ac = rec[:, 6].astype(np.float32)
-    ff = rec[:, 7]
-    diff = rec[:, 8].astype(np.float32) - 51.0
+    pose = rec[:, 0].astype(np.int64) | (rec[:, 1].astype(np.int64) << 8)
+    turn = rec[:, 2].astype(np.float32)
+    me_move = rec[:, 3].astype(np.float32)
+    ac = rec[:, 4].astype(np.float32)
+    f_b = rec[:, 5].astype(np.float32)
+    f_o = rec[:, 6].astype(np.float32)
+    diff = rec[:, 7].astype(np.float32) - 51.0
 
     feats = np.zeros((N, IN_DIM), dtype=np.float32)
-
-    def put_pos(plane: np.ndarray, pose: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        cd = pose % 12
-        t = pose // 12
-        fi = t % 4
-        cell = t // 4
-        np.add.at(plane, (np.arange(N), cell), 1.0)
-        return fi, cd
-
-    fi_r, cd_r = put_pos(feats[:, 0:49], pr)
-    fi_b, cd_b = put_pos(feats[:, 49:98], pb)
+    cell = pose // 48
+    fi = (pose // 12) % 4
+    cd = pose % 12
+    np.add.at(feats[:, 0:49], (np.arange(N), cell), 1.0)
+    for byte in range(7):
+        for bit in range(8):
+            c = byte * 8 + bit
+            if c < 49:
+                feats[:, 49 + c] = ((rec[:, 8 + byte] >> bit) & 1).astype(np.float32)
 
     sc = feats[:, 98:]
     for i in range(4):
-        sc[:, i] = (fi_r == i).astype(np.float32)
-        sc[:, 4 + i] = (fi_b == i).astype(np.float32)
-    sc[:, 8] = (cd_r // 4).astype(np.float32) / 2.0
-    sc[:, 9] = (cd_b // 4).astype(np.float32) / 2.0
-    sc[:, 10] = (cd_r % 4).astype(np.float32) / 3.0
-    sc[:, 11] = (cd_b % 4).astype(np.float32) / 3.0
-    sc[:, 12] = turn / 25.0
-    sc[:, 13] = side
-    sc[:, 14] = ac / 3.0
-    sc[:, 15] = ((ff >> 1) & 1).astype(np.float32)
-    sc[:, 16] = (ff & 1).astype(np.float32)
-    sc[:, 17] = diff / 51.0
+        sc[:, i] = (fi == i).astype(np.float32)
+    sc[:, 4] = (cd // 4).astype(np.float32) / 2.0
+    sc[:, 5] = (cd % 4).astype(np.float32) / 3.0
+    sc[:, 6] = turn / 25.0
+    sc[:, 7] = me_move
+    sc[:, 8] = ac / 3.0
+    sc[:, 9] = f_b
+    sc[:, 10] = f_o
+    sc[:, 11] = diff / 51.0
     return feats
 
 

@@ -50,14 +50,14 @@ def main() -> int:
 
     data = ROOT / args.data if not Path(args.data).is_absolute() else Path(args.data)
     raw = np.fromfile(data, dtype=np.uint8)
-    assert raw.size % 10 == 0, "记录长度必须是 10 字节"
-    rec = raw.reshape(-1, 10)
+    assert raw.size % 20 == 0, "记录长度必须是 20 字节（v2）"
+    rec = raw.reshape(-1, 20)
     print(f"读取值样本 {data}  ({len(rec):,} 条)")
-    val = rec[:, 9].astype(np.int16) - 1.0  # {-1,0,1}
+    val = np.frombuffer(rec[:, 15:19].tobytes(), dtype=np.float32)  # E[V|belief]
     X = torch.from_numpy(build_features(rec))
     Y = torch.from_numpy(val.astype(np.float32))
-    print(f"  值分布: 胜 {int((val>0).sum()):,}  平 {int((val==0).sum()):,}  "
-          f"负 {int((val<0).sum()):,}")
+    print(f"  标签: 均值 {val.mean():+.4f}  范围 [{val.min():+.3f}, {val.max():+.3f}]  "
+          f"|label|<1 占比 {(np.abs(val)<1).mean()*100:.1f}%")
 
     if args.device == "cuda":
         DEV = torch.device("cuda:0")
@@ -91,7 +91,7 @@ def main() -> int:
                 opt.step()
             with torch.no_grad():
                 pred = torch.round(v.clamp(-1, 1))
-                hit = (pred == Y[b]).float().sum()
+                hit = ((pred - Y[b]).abs() < 0.5).float().sum()
             tot_l += float(loss) * len(b)
             tot_hit += float(hit)
             tot_n += len(b)

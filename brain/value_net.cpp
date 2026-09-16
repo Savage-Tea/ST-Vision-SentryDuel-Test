@@ -55,52 +55,45 @@ bool value_eval(const float* features, float* v) {
 }
 #endif
 
-void value_features(const sim::State& s, bool red_to_move, bool free_red,
-                    bool free_blue, bool swap_colors, float* out) {
+void value_features(const sim::State& s, const sim::Belief& belief,
+                    bool me_to_move, bool my_free, bool opp_free, float* out) {
     std::memset(out, 0, sizeof(float) * kValueObsDim);
-    // 位置平面：one-hot。局部帧里 s.red=我方；swap_colors 决定谁是"世界红"。
-    const Sentry& red = swap_colors ? s.blue : s.red;
-    const Sentry& blue = swap_colors ? s.red : s.blue;
+    const Sentry& me = s.red;   // 局部帧：我方恒在 red 槽位
 
     const auto put_pos = [&](float* plane, const Pos& p) {
         if (p.x >= 0 && p.x < sim::kBoardSize && p.y >= 0 && p.y < sim::kBoardSize) {
             plane[p.y * sim::kBoardSize + p.x] = 1.0f;
         }
     };
-    put_pos(out, red.last_known_pos);
-    put_pos(out + 49, blue.last_known_pos);
+    put_pos(out, me.last_known_pos);
+    // 信念平面：我推断的对手可能位置集合
+    for (int y = 0; y < sim::kBoardSize; ++y) {
+        for (int x = 0; x < sim::kBoardSize; ++x) {
+            if (belief.has(x, y)) out[49 + y * sim::kBoardSize + x] = 1.0f;
+        }
+    }
 
     float* sc = out + 98;
     int n = 0;
-    const auto facing_idx = [](char f) -> int {
-        switch (f) {
-            case 'N': return 0;
-            case 'E': return 1;
-            case 'S': return 2;
-            case 'W': return 3;
-            default: return -1;
-        }
-    };
-    const int fri = facing_idx(red.last_known_facing);
-    if (fri >= 0) sc[fri] = 1.0f;
+    int fi = -1;
+    switch (me.last_known_facing) {
+        case 'N': fi = 0; break;
+        case 'E': fi = 1; break;
+        case 'S': fi = 2; break;
+        case 'W': fi = 3; break;
+        default: break;
+    }
+    if (fi >= 0) sc[fi] = 1.0f;
     n += 4;
-    const int bfi = facing_idx(blue.last_known_facing);
-    if (bfi >= 0) sc[n + bfi] = 1.0f;
-    n += 4;
-    sc[n++] = static_cast<float>(red.fire_cd) / 2.0f;
-    sc[n++] = static_cast<float>(blue.fire_cd) / 2.0f;
-    sc[n++] = static_cast<float>(red.scan_cd) / 3.0f;
-    sc[n++] = static_cast<float>(blue.scan_cd) / 3.0f;
+    sc[n++] = static_cast<float>(me.fire_cd) / 2.0f;
+    sc[n++] = static_cast<float>(me.scan_cd) / 3.0f;
     sc[n++] = static_cast<float>(s.turn) / 25.0f;
-    sc[n++] = red_to_move ? 1.0f : 0.0f;
-    sc[n++] = 0.0f; // ac 占位：搜索叶的已用额度语义分散在两个相位点上，
-                    // 对 V* 的影响经由 turn/旗标间接覆盖；保持 0 并在
-                    // 训练侧同样置 0，两侧一致即可。
-    sc[n++] = free_red ? 1.0f : 0.0f;
-    sc[n++] = free_blue ? 1.0f : 0.0f;
-    sc[n++] = static_cast<float>(red.score - blue.score) / 51.0f;
-    // 编译期核对：4+4+10 = 18 个标量
-    static_assert(kValueObsDim == 98 + 18, "标量数与特征契约不一致");
+    sc[n++] = me_to_move ? 1.0f : 0.0f;
+    sc[n++] = 0.0f; // ac：部署查询点都在相位边界（ac=0），训练侧同样置 0
+    sc[n++] = my_free ? 1.0f : 0.0f;
+    sc[n++] = opp_free ? 1.0f : 0.0f;
+    sc[n++] = static_cast<float>(s.red.score - s.blue.score) / 51.0f;
+    static_assert(kValueObsDim == 98 + 12, "标量数与特征契约不一致");
     (void)n;
 }
 

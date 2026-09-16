@@ -24,6 +24,7 @@
 
 #include "brain/actions.h"
 #include "obs/encode_v3.h"
+#include "sim/belief.h"
 #include "sim/rules.h"
 #include "sim/view_mirror.h"
 
@@ -551,39 +552,118 @@ int main(int argc, char** argv) {
     // 所以 --from-turn 测的是"从该回合 0:0 开始"的子博弈，用于量搜索规模。
     const int v = search(init, 'R', 0, true, true, 0, kLose, kWin, kTurnN - from_turn);
 
-    // —— 值蒸馏采样：从 TT 里抽 kExact 条目写 (状态字段, V*) ——
+    // —— 值蒸馏采样 v2：信念期望标签 ——
     //
-    // 键本身就是状态（pr,pb,turn,side,ac,freef,diff），解出来就是特征。
-    // 只采 kExact（真值）；kLower/kUpper 是 αβ 窗口边界，做回归会引入偏差。
-    // 蓄水池采样固定条数，避免对遍历顺序敏感。
+    // v1 的教训：V* 是双方位置的阶跃函数，部署时对手位置只有信念锚点
+    // （带噪输入），在阶梯函数上查噪声输入 ≈ 抛硬币，0/400。
+    //
+    // v2 把标签换成 **E[V* | 信念集]**：对每个样本，把对手真实位置经
+    // dilate(3) + 视线剪枝展开成信念集，对集合内 (位置 × 4 朝向) 逐个查
+    // TT 取 V* 求平均。期望是信念集的连续函数——可学习，且正是部署叶上
+    // 能算出来的那个量（搜索树里现成有 Belief）。
+    //
+    // 编码采用"信徒相对"形式：特征全部从持信念者视角出发（我的位置/朝向/
+    // CD/免费旗标/分差，对手只剩信念平面），每条求解器状态产出一对样本
+    // （红持信念 / 蓝持信念），网络因此是颜色无关的，部署时不需要任何
+    // swap/取反——局部帧直接喂。
+    //
+    // 对手的 CD 未知（引擎不暴露，部署按"随时可用"保守假设），所以查表时
+    // 固定对手 fcd=0/scd=0，训练与部署一致。
     if (dump_values_path != nullptr) {
-        std::printf("\n值采样: 目标 %ld 条 kExact → %s\n", dump_values_n, dump_values_path);
+        std::printf("\n值采样 v2: 目标 %ld 状态 → %s\n", dump_values_n, dump_values_path);
         std::fflush(stdout);
         std::FILE* fv = std::fopen(dump_values_path, "wb");
         if (fv == nullptr) {
             std::fprintf(stderr, "值采样: 打不开输出 %s\n", dump_values_path);
             return 1;
         }
-        std::mt19937_64 vrng(20260917ull);
-        long long seen_exact = 0, seen_total = 0, written = 0;
-        // 可采 = kExact，或"饱和边界"（三值域上等价于真值）：
-        //   kLower 且 v=+1  => 红胜（下界已到顶）
-        //   kUpper 且 v=-1  => 红负（上界已到底）
         auto harvestable = [](const Entry& e) {
             return e.flag == 0 || (e.flag == 1 && e.value == 1) ||
                    (e.flag == 2 && e.value == -1);
         };
+        std::mt19937_64 vrng(20260918ull);
+        long long seen_exact = 0, seen_total = 0;
         for (const auto& kv : g_tt) {
             ++seen_total;
             if (harvestable(kv.second)) ++seen_exact;
         }
-        long long stride_seen = 0;
+        std::printf("  可采 %lld / 总 %lld\n", seen_exact, seen_total);
+        std::fflush(stdout);
+
+        const auto encode_q = [&](int cell, char f) -> std::uint64_t {
+            int fi = 0;
+            for (int i = 0; i < 4; ++i) {
+                if ("NESW"[i] == f) fi = i;
+            }
+            const int pr2 = ((cell * 4) + fi) * 12; // fcd=0, scd=0
+            return pr2;
+        };
+
+        // 单个信念样本：围绕 set_center 扩张信念集，对 (位置 × 4 朝向) 查
+        // V_red 并取均值。red_pose/blue_pose 是键里的固定姿态。
+        // 返回 false = 命中率太低，标签不可靠，丢弃。
+        int lookups = 0, hits = 0;
+        double sum = 0.0;
+        std::uint8_t bits[7] = {0, 0, 0, 0, 0, 0, 0};
+        const auto expect_label = [&](int red_pose, int blue_pose, int set_center,
+                                      int tn, int sidx, int acx, int ffx, int ddx,
+                                      float* label) {
+            // 姿态码 = ((cell*4)+facing)*12 + cd → cell = pose / 48
+            const int center_cell = set_center / 48;
+            const int center_x = center_cell % sim::kBoardSize;
+            const int center_y = center_cell / sim::kBoardSize;
+            sim::Belief bel;
+            bel.reset_to(Pos{center_x, center_y});
+            const int watcher_pose = (sidx == 0) ? red_pose : blue_pose;
+            sim::dilate(bel, 3, Pos{center_x, center_y}, init.obstacles);
+            Sentry watcher{};
+            const int watcher_cell = watcher_pose / 48;
+            watcher.last_known_pos = Pos{watcher_cell % sim::kBoardSize,
+                                         watcher_cell / sim::kBoardSize};
+            watcher.last_known_facing = "NESW"[(watcher_pose / 12) % 4];
+            sim::prune_by_vision(bel, watcher, init.obstacles);
+            std::memset(bits, 0, sizeof(bits));
+            for (int c = 0; c < 49; ++c) {
+                if (bel.has(c % sim::kBoardSize, c / sim::kBoardSize)) {
+                    bits[c / 8] |= static_cast<std::uint8_t>(1u << (c % 8));
+                }
+            }
+            const int fixed_r = (sidx == 0) ? red_pose : blue_pose;
+            const int fixed_b = (sidx == 0) ? blue_pose : red_pose;
+            lookups = 0;
+            hits = 0;
+            sum = 0.0;
+            for (int c = 0; c < 49; ++c) {
+                if (!(bits[c / 8] >> (c % 8) & 1)) continue;
+                for (char f : {'N', 'E', 'S', 'W'}) {
+                    ++lookups;
+                    int fi = 0;
+                    for (int i = 0; i < 4; ++i) {
+                        if ("NESW"[i] == f) fi = i;
+                    }
+                    const int q = ((c * 4) + fi) * 12; // 对手 CD 恒按 0/0
+                    const std::uint64_t k2 =
+                        (sidx == 0) ? make_key(fixed_r, q, tn, 0, acx, ffx, ddx)
+                                    : make_key(q, fixed_b, tn, 1, acx, ffx, ddx);
+                    const auto it = g_tt.find(k2);
+                    if (it == g_tt.end()) continue;
+                    ++hits;
+                    sum += static_cast<double>(it->second.value);
+                }
+            }
+            if (lookups == 0 || hits * 4 < lookups) return false;
+            *label = static_cast<float>(sum / hits);
+            return true;
+        };
+
+        long long stride_seen = 0, written = 0, skipped = 0;
+        const long long stride = (seen_exact + dump_values_n - 1) / dump_values_n + 1;
         for (const auto& kv : g_tt) {
             if (!harvestable(kv.second)) continue;
             ++stride_seen;
-            // 系统采样：每 seen_exact/dump_n 个取 1 个，加随机起点相位
-            const long long stride = seen_exact / dump_values_n + 1;
             if ((stride_seen + vrng() % stride) % stride != 0) continue;
+            if (written >= dump_values_n * 2) break;
+
             std::uint64_t t = kv.first;
             const int dd = static_cast<int>(t % kDiffN) - kDiffMax; t /= kDiffN;
             const int ff = static_cast<int>(t % 4); t /= 4;
@@ -592,24 +672,44 @@ int main(int argc, char** argv) {
             const int tn = static_cast<int>(t % kTurnN);
             const int pair = static_cast<int>(t / kTurnN);
             const int pr = pair / kPoses, pb = pair % kPoses;
-            unsigned char rec[10] = {
-                static_cast<unsigned char>(pr & 0xFF),
-                static_cast<unsigned char>((pr >> 8) & 0xFF),
-                static_cast<unsigned char>(pb & 0xFF),
-                static_cast<unsigned char>((pb >> 8) & 0xFF),
-                static_cast<unsigned char>(tn),
-                static_cast<unsigned char>(sidx),
-                static_cast<unsigned char>(acx),
-                static_cast<unsigned char>(ff),
-                static_cast<unsigned char>(dd + kDiffMax),
-                static_cast<unsigned char>(kv.second.value + 1), // -1..1 -> 0..2
-            };
-            std::fwrite(rec, 1, 10, fv);
-            ++written;
+
+            // 两个信徒视角：who=0 红持信念（集围绕蓝），who=1 蓝持信念（集围绕红）
+            for (int who = 0; who < 2; ++who) {
+                const int pose_bel = who == 0 ? pr : pb;
+                const int me_move = (sidx == who) ? 1 : 0;
+                const int f_b = (who == 0) ? ((ff & 2) ? 1 : 0) : (ff & 1);
+                const int f_o = (who == 0) ? (ff & 1) : ((ff & 2) ? 1 : 0);
+                const int d_mine = (who == 0) ? dd : -dd;
+
+                float lbl_red_persp = 0.0f;
+                if (!expect_label(pr, pb, who == 0 ? pb : pr, tn, sidx, acx, ff,
+                                  dd, &lbl_red_persp)) {
+                    ++skipped;
+                    continue;
+                }
+                const float label = (who == 0) ? lbl_red_persp : -lbl_red_persp;
+
+                std::uint8_t rec[20] = {0};
+                rec[0] = static_cast<unsigned char>(pose_bel & 0xFF);
+                rec[1] = static_cast<unsigned char>((pose_bel >> 8) & 0xFF);
+                rec[2] = static_cast<unsigned char>(tn);
+                rec[3] = static_cast<unsigned char>(me_move);
+                rec[4] = static_cast<unsigned char>(acx);
+                rec[5] = static_cast<unsigned char>(f_b);
+                rec[6] = static_cast<unsigned char>(f_o);
+                rec[7] = static_cast<unsigned char>(d_mine + kDiffMax);
+                for (int bi = 0; bi < 7; ++bi) rec[8 + bi] = bits[bi];
+                std::memcpy(rec + 15, &label, 4); // 15..18，第 19 字节留 0
+                std::fwrite(rec, 1, 20, fv);
+                ++written;
+            }
+            if (written % 1000000 == 0 && written > 0) {
+                std::printf("  值采样 v2: 已写 %ld, 跳过 %ld\n", written, skipped);
+                std::fflush(stdout);
+            }
         }
         std::fclose(fv);
-        std::printf("  值采样完成: exact %lld / 总 %lld, 写出 %ld 条\n",
-                    seen_exact, seen_total, written);
+        std::printf("  值采样 v2 完成: 写出 %ld 条, 跳过 %ld 条\n", written, skipped);
         std::fflush(stdout);
     }
 

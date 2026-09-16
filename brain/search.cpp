@@ -26,22 +26,17 @@ struct Leaf {
 // 且只影响免费转向这种小代价动作——对值的影响是二阶的）。
 double leaf_eval(const sim::State& after, const sim::Belief& b, const Weights& w,
                  bool acts_first, bool use_vnet, double vscale, int used,
-                 bool my_free_left) {
+                 bool opp_to_move, bool my_free_left) {
     if (use_vnet && brain::value_net_available()) {
         float feats[brain::kValueObsDim];
-        const bool swap = !acts_first; // 我执蓝 → 世界红方在 s.blue
-        const bool red_to_move = swap; // after = 局部红已收尾 → 局部蓝行动中；
-                                       // 世界红行动中 ⟺ 我执蓝
-        const bool world_free_red = swap ? my_free_left
-                                         : sim::is_at_spawn(after, 'B');
-        const bool world_free_blue = swap ? sim::is_at_spawn(after, 'R')
-                                          : my_free_left;
-        brain::value_features(after, red_to_move, world_free_red, world_free_blue,
-                              swap, feats);
+        // v2 网络是信徒相对的（颜色无关）：局部帧直喂，无需 swap/取反。
+        // 对手免费旗标用出生点近似（免费转向只影响小代价动作，二阶项）。
+        const bool opp_free = sim::is_at_spawn(after, 'B');
+        brain::value_features(after, b, /*me_to_move=*/!opp_to_move,
+                              my_free_left, opp_free, feats);
         float v = 0.0f;
         brain::value_eval(feats, &v);
-        return static_cast<double>(acts_first ? v : -v) * vscale
-               - w.w_waste * static_cast<double>(used);
+        return static_cast<double>(v) * vscale - w.w_waste * static_cast<double>(used);
     }
     return evaluate(after, w, b, acts_first) - w.w_waste * static_cast<double>(used);
 }
@@ -60,7 +55,7 @@ void dfs_our(const sim::State& s, const sim::Belief& b, int used, bool free_turn
         leaf.plan.count = depth;
         // 行动是有限资源：同等局面下优先选消耗更少的方案（仅用于打破平局）
         leaf.value = leaf_eval(after, b, w, acts_first, use_vnet, vscale, used,
-                               free_turn);
+                               /*opp_to_move=*/true, free_turn);
         leaf.state = after;
         leaf.belief = b;
         leaf.plan.valid = true;
@@ -106,7 +101,8 @@ void dfs_opp(const sim::State& s, const sim::Belief& b, int used, bool free_turn
         sim::State after = s;
         sim::end_side_turn(after, 'B');
         worst = std::min(worst, leaf_eval(after, b, w, acts_first, use_vnet, vscale,
-                                          used, free_turn));
+                                          used, /*opp_to_move=*/false,
+                                          sim::is_at_spawn(after, 'R')));
         ++st.opp_nodes;
     }
 
@@ -145,7 +141,8 @@ double opponent_best(const sim::State& s, const sim::Belief& b, const Weights& w
     const bool opp_sees_us = sim::can_see(base.blue, base.red.last_known_pos, base.obstacles);
 
     const bool free_turn = sim::is_at_spawn(base, 'B');
-    double worst = leaf_eval(base, b, w, acts_first, use_vnet, vscale, 0, free_turn);
+    double worst = leaf_eval(base, b, w, acts_first, use_vnet, vscale, 0,
+                             /*opp_to_move=*/true, free_turn);
     dfs_opp(base, b, 0, free_turn, opp_sees_us, 0, worst, dl, st, w, acts_first,
             use_vnet, vscale);
     return worst;
