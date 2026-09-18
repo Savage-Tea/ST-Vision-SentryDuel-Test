@@ -83,6 +83,8 @@ const bool g_opp_window = env_flag("ST_OPP_WINDOW");
 double env_double(const char* name, double fallback); // 定义见下方
 const bool g_use_value_net = env_flag("ST_VALUE_NET");
 const double g_value_scale = env_double("ST_VALUE_SCALE", 30.0);
+// 两回合前瞻（深模式）。ST_DEEP=1 启用，ST_DEEP_NODES 调预算。
+const int g_deep_turns = env_int("ST_DEEP", 0);
 
 double env_double(const char* name, double fallback); // 定义见下方
 
@@ -279,6 +281,7 @@ void run(const Board& board, char my_color) {
         in.acts_first_world = (my_color == 'R');
         in.use_value_net = g_use_value_net;
         in.value_scale = g_value_scale;
+        in.deep_turns = g_deep_turns;
 
         brain::SearchStats stats;
         brain::Plan plan;

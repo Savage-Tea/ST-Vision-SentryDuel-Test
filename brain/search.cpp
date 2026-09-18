@@ -124,10 +124,101 @@ void dfs_opp(const sim::State& s, const sim::Belief& b, int used, bool free_turn
     }
 }
 
+// ═════════ 深模式：两回合前瞻（我极大 → 对手极小 → end_round → 循环）═════════
+//
+// 浅层搜索只看"我方阶段 + 对手回应"，看不见"这步走进的走廊两回合后把我
+// 关进枪线"的链条——最优策略线的挖掘（build/strategy_lines.csv）表明均衡
+// 策略本质是耐心诱导，恰好需要这个深度才能看见。
+//
+// 预算与可靠性：节点预算耗尽 → complete=false → 上层回退浅层值。
+// 部分探索的极小值对对手是乐观的（未探索=未惩罚），会骗我方走险手，
+// 所以宁可弃用。终局/截止时间同理。
+
+// 递归体：turns_left 还剩几轮"我+对手"完整回合。complete 置 false = 不可信。
+// is_my_turn: 当前行动阶段属于我方（true）或对手（false）。
+double deep_value(const sim::State& s, const sim::Belief& b, int used,
+                  bool my_free, bool opp_free, bool enemy_visible, int turns_left,
+                  bool is_my_turn, const Deadline& dl, SearchStats& st,
+                  const Weights& w, bool use_vnet, double vscale,
+                  long long& budget, bool& complete) {
+    if (budget <= 0) { complete = false; return 0.0f; }
+    if (out_of_time(dl)) { st.time_exhausted = true; complete = false; return 0.0f; }
+    --budget;
+
+    // 行动阶段结束 + 回合收尾的值（终局/静态都走这里）
+    const auto phase_end_value = [&](const sim::State& phase_done,
+                                     bool opp_just_acted) -> double {
+        sim::State er = phase_done;
+        if (opp_just_acted) sim::end_round(er); // 对手阶段结束 = 整回合结束
+        if (brain::is_terminal(er)) {
+            // 终局：用分差排序（与手工评估同尺度）
+            return static_cast<double>(er.red.score - er.blue.score) * vscale;
+        }
+        if (turns_left <= (opp_just_acted ? 1 : 0)) {
+            return leaf_eval(er, b, w, /*acts_first=*/true, use_vnet, vscale, used,
+                             /*opp_to_move=*/!opp_just_acted,
+                             /*my_free_left=*/sim::is_at_spawn(er, 'R'));
+        }
+        if (opp_just_acted) {
+            // 整回合结束 → 我方下一阶段
+            return deep_value(er, b, 0, sim::is_at_spawn(er, 'R'),
+                              sim::is_at_spawn(er, 'B'), enemy_visible,
+                              turns_left - 1, /*is_my_turn=*/true, dl, st, w,
+                              use_vnet, vscale, budget, complete);
+        }
+        // 我方阶段结束 → 对手阶段（同一回合）
+        return deep_value(er, b, 0, my_free, opp_free, enemy_visible, turns_left,
+                          /*is_my_turn=*/false, dl, st, w, use_vnet, vscale, budget,
+                          complete);
+    };
+
+    const char side = is_my_turn ? 'R' : 'B';
+    const bool my_free_eff = is_my_turn ? my_free : opp_free;
+    const bool opp_free_eff = is_my_turn ? opp_free : my_free;
+
+    std::vector<Cand> cands;
+    collect_candidates(s, side, my_free_eff, enemy_visible, nullptr, nullptr, cands);
+
+    // 收手（结束当前阶段）永远是候选
+    {
+        sim::State es = s;
+        sim::end_side_turn(es, side);
+        const double v = phase_end_value(es, /*opp_just_acted=*/!is_my_turn);
+        if (!complete) return 0.0f;
+        // 记为当前最好值；动作候选在下面尝试超越它
+        double cur_best = v;
+        for (const Cand& c : cands) {
+            sim::State ns = s;
+            int nused = used;
+            bool nft = my_free_eff;
+            if (!apply_step(ns, side, c, nused, nft)) continue;
+            if (is_my_turn) {
+                sim::Belief nb = b;
+                sim::prune_by_vision(nb, ns.red, ns.obstacles);
+                if (nb.empty()) nb = b;
+                const double cv = deep_value(ns, nb, nused, nft, opp_free_eff,
+                                             enemy_visible, turns_left, true, dl, st,
+                                             w, use_vnet, vscale, budget, complete);
+                if (!complete) return 0.0f;
+                if (cv > cur_best) cur_best = cv;
+            } else {
+                // 对手行动后我方视野不变（我们看不见他的移动）
+                const double cv = deep_value(ns, b, nused, my_free, nft,
+                                             enemy_visible, turns_left, false, dl, st,
+                                             w, use_vnet, vscale, budget, complete);
+                if (!complete) return 0.0f;
+                if (cv < cur_best) cur_best = cv;
+            }
+        }
+        return cur_best;
+    }
+}
+
 // 对手在我方叶子状态上的最优回应值
 double opponent_best(const sim::State& s, const sim::Belief& b, const Weights& w,
                      bool acts_first, bool use_vnet, double vscale,
-                     int opp_def_until, const Deadline& dl, SearchStats& st) {
+                     int opp_def_until, const Deadline& dl, SearchStats& st,
+                     int deep_turns) {
     sim::State base = s;
     // 对手的 CD 在观测里恒为 -1（引擎不暴露），保守假设其随时可开火；
     // 唯一例外是被击中推断出的无力窗口——那是对手刚开火的确定性情报，
@@ -141,6 +232,21 @@ double opponent_best(const sim::State& s, const sim::Belief& b, const Weights& w
     const bool opp_sees_us = sim::can_see(base.blue, base.red.last_known_pos, base.obstacles);
 
     const bool free_turn = sim::is_at_spawn(base, 'B');
+
+    // 深模式：两回合前瞻。预算耗尽 → 回退浅层值（部分探索的极小值对对手
+    // 是乐观的，会骗我方走险手，不可信）。
+    if (deep_turns > 0) {
+        long long budget = kDeepNodeBudget;
+        bool complete = true;
+        const double v = deep_value(base, b, 0, free_turn,
+                                    /*opp_free=*/sim::is_at_spawn(base, 'R'),
+                                    /*enemy_visible=*/false, deep_turns,
+                                    /*is_my_turn=*/false, dl, st, w, use_vnet,
+                                    vscale, budget, complete);
+        if (complete) return v;
+        // 回退浅层
+    }
+
     double worst = leaf_eval(base, b, w, acts_first, use_vnet, vscale, 0,
                              /*opp_to_move=*/true, free_turn);
     dfs_opp(base, b, 0, free_turn, opp_sees_us, 0, worst, dl, st, w, acts_first,
@@ -179,7 +285,7 @@ Plan search_turn(const TurnInput& in, const Weights& w, const Deadline& deadline
         leaves[i].value =
             opponent_best(leaves[i].state, leaves[i].belief, w, in.acts_first_world,
                           in.use_value_net, in.value_scale,
-                          in.opp_defenseless_until, deadline, st);
+                          in.opp_defenseless_until, deadline, st, in.deep_turns);
         ++refined;
     }
     st.refined = refined;

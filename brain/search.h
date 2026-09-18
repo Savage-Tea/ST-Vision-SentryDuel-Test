@@ -22,6 +22,9 @@ inline constexpr int kMaxActions = 3;
 
 // 对手回应细化的候选上限（按未细化评估排序后取前 K 个），用来界定最坏耗时
 inline constexpr int kRefineTopK = 48;
+// 深模式（两回合前瞻）的单叶节点预算。超出即回退浅层值——部分探索的
+// 极小值对对手乐观，会骗我方走险手，宁可不用。
+inline constexpr long long kDeepNodeBudget = 150000;
 
 struct Plan {
     int count = 0;
@@ -51,6 +54,8 @@ struct TurnInput {
     // 奖励可比的量级（终局 ±1e6，手工评估 ±10s）。
     bool use_value_net = false;
     double value_scale = 30.0;
+    // 两回合前瞻（深模式）。0 = 关闭；1 = 在对手回应之后再看一轮我方+对手。
+    int deep_turns = 0;
     // 对手"刚刚开过火、正处在 CD 无力期"的推断：被击中时，打我们的人必然
     // 刚开火。引擎不暴露对手 CD（观测恒 -1，默认保守假设随时可开火），
     // 但这次击中本身泄露了信息。窗口按 CD 时序不对称折算：
