@@ -298,8 +298,9 @@ int warm_action(const sim::State& world, char side, int ac, bool fr, bool fb, in
 }
 
 // 跑一局：教师路径读 e.best，ε 或冷状态随机走（冷步不写数据——没有精确标签）。
+// strat 非空时，逐步落盘世界事实（供离线策略挖掘，与 SDPP 数据流独立）。
 void play_teacher_game(std::mt19937& rng, double eps, int from_turn,
-                       Seq& seq_r, Seq& seq_b) {
+                       Seq& seq_r, Seq& seq_b, std::FILE* strat) {
     sim::State world = sim::make_initial_state();
     world.turn = from_turn;
     sim::ViewMirror mirror;
@@ -328,6 +329,16 @@ void play_teacher_game(std::mt19937& rng, double eps, int from_turn,
                 const int diff = world.red.score - world.blue.score;
                 int warm = warm_action(world, side, used,
                                        side_free[0], side_free[1], diff);
+                if (strat != nullptr) {
+                    std::fprintf(strat, "%d,%c,%d,%d,%c,%c,%d,%d,%d,%d,%d,%d,%d,%d\n",
+                                 world.turn, side,
+                                 world.red.last_known_pos.y * 7 + world.red.last_known_pos.x,
+                                 world.blue.last_known_pos.y * 7 + world.blue.last_known_pos.x,
+                                 world.red.last_known_facing, world.blue.last_known_facing,
+                                 world.red.fire_cd, world.blue.fire_cd,
+                                 world.red.scan_cd, world.blue.scan_cd,
+                                 world.red.score, world.blue.score, used, warm);
+                }
                 const bool cold = warm < 0;
                 std::vector<Move> mv;
                 if (cold) gen_moves(world, side, mv);
@@ -384,21 +395,27 @@ void play_teacher_game(std::mt19937& rng, double eps, int from_turn,
     }
 }
 
-void run(const std::string& prefix, int games, double eps, int from_turn) {
-    std::FILE* f = std::fopen(prefix.c_str(), "wb");
-    if (f == nullptr) {
-        std::fprintf(stderr, "teacher: 打不开输出 %s\n", prefix.c_str());
-        std::exit(1);
+void run(const std::string& prefix, int games, double eps, int from_turn,
+         const char* strat_path, int strat_games, double strat_eps) {
+    std::FILE* f = nullptr;
+    if (!prefix.empty()) {
+        f = std::fopen(prefix.c_str(), "wb");
+        if (f == nullptr) {
+            std::fprintf(stderr, "teacher: 打不开输出 %s\n", prefix.c_str());
+            std::exit(1);
+        }
     }
     const char magic[4] = {'S', 'D', 'P', 'P'};
     const std::uint32_t version = 1, obs_dim = obs::kObsDimV3;
     const std::uint32_t act_dim = static_cast<std::uint32_t>(brain::kActionDim);
     const std::uint32_t g32 = static_cast<std::uint32_t>(games);
-    std::fwrite(magic, 1, 4, f);
-    std::fwrite(&version, sizeof(version), 1, f);
-    std::fwrite(&obs_dim, sizeof(obs_dim), 1, f);
-    std::fwrite(&act_dim, sizeof(act_dim), 1, f);
-    std::fwrite(&g32, sizeof(g32), 1, f);
+    if (f != nullptr) {
+        std::fwrite(magic, 1, 4, f);
+        std::fwrite(&version, sizeof(version), 1, f);
+        std::fwrite(&obs_dim, sizeof(obs_dim), 1, f);
+        std::fwrite(&act_dim, sizeof(act_dim), 1, f);
+        std::fwrite(&g32, sizeof(g32), 1, f);
+    }
 
     std::mt19937 rng(20260916u);
     const auto t0 = std::chrono::steady_clock::now();
@@ -487,10 +504,22 @@ void run(const std::string& prefix, int games, double eps, int from_turn) {
         std::fflush(stdout);
     }
 
+    // —— 策略线：低 ε 近最优对局，世界事实逐步落盘，供离线策略挖掘 ——
+    std::FILE* strat = nullptr;
+    if (strat_path != nullptr) {
+        strat = std::fopen(strat_path, "w");
+        if (strat == nullptr) {
+            std::fprintf(stderr, "teacher: 打不开策略输出 %s\n", strat_path);
+            std::exit(1);
+        }
+        std::fprintf(strat, "turn,side,rcell,bcell,rf,bf,rcd,bcd,rsd,bsd,rs,bs,used,act\n");
+    }
+
     for (int g = 0; g < games; ++g) {
         Seq r, b;
-        play_teacher_game(rng, eps, from_turn, r, b);
+        play_teacher_game(rng, eps, from_turn, r, b, strat);
         for (const Seq* sq : {&r, &b}) {
+            if (f == nullptr) continue; // 仅策略线模式：不写 SDPP
             const std::uint32_t n = static_cast<std::uint32_t>(sq->action.size());
             std::fwrite(&n, sizeof(n), 1, f);
             for (std::size_t i = 0; i < sq->action.size(); ++i) {
@@ -505,13 +534,18 @@ void run(const std::string& prefix, int games, double eps, int from_turn) {
             std::fflush(stdout);
         }
     }
-    std::fclose(f);
+    if (f != nullptr) std::fclose(f);
+    if (strat != nullptr) std::fclose(strat);
     const double secs =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     std::printf("  teacher 完成: %d 局, %.1f 秒\n", games, secs);
+    if (strat_path != nullptr) {
+        std::printf("  策略线已写出: %s (ε=%.2f)\n", strat_path, strat_eps);
+        std::fflush(stdout);
+    }
 }
 
-} // namespace teacher} // namespace teacher
+} // namespace teacher
 
 int main(int argc, char** argv) {
     int from_turn = 0;
@@ -521,6 +555,9 @@ int main(int argc, char** argv) {
     double teacher_eps = 0.3;
     const char* dump_values_path = nullptr;
     long dump_values_n = 8000000;
+    const char* strategy_path = nullptr;
+    int strategy_games = 300;
+    double strategy_eps = 0.05;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--from-turn") == 0 && i + 1 < argc) {
             from_turn = std::atoi(argv[++i]);
@@ -536,6 +573,12 @@ int main(int argc, char** argv) {
             dump_values_path = argv[++i];
         } else if (std::strcmp(argv[i], "--dump-n") == 0 && i + 1 < argc) {
             dump_values_n = std::atoll(argv[++i]);
+        } else if (std::strcmp(argv[i], "--strategy-dump") == 0 && i + 1 < argc) {
+            strategy_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--strategy-games") == 0 && i + 1 < argc) {
+            strategy_games = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--strategy-eps") == 0 && i + 1 < argc) {
+            strategy_eps = std::atof(argv[++i]);
         }
     }
     g_max_turn = 25;
@@ -713,12 +756,14 @@ int main(int argc, char** argv) {
         std::fflush(stdout);
     }
 
-    // —— teacher 模式：求解完成后直接产出蒸馏数据 ——
-    if (teacher_prefix != nullptr) {
+    // —— teacher 模式：求解完成后产出蒸馏数据 / 策略线 ——
+    if (teacher_prefix != nullptr || strategy_path != nullptr) {
         std::printf("\nteacher 自对弈: %d 局 / ε=%.2f → %s\n", teacher_games,
-                    teacher_eps, teacher_prefix);
+                    teacher_eps, teacher_prefix ? teacher_prefix : "(仅策略线)");
         std::fflush(stdout);
-        teacher::run(teacher_prefix, teacher_games, teacher_eps, from_turn);
+        teacher::run(teacher_prefix ? teacher_prefix : "",
+                     teacher_games, teacher_eps, from_turn,
+                     strategy_path, strategy_games, strategy_eps);
     }
 
     const char* name[] = {"红负", "平", "红胜"};
