@@ -36,7 +36,10 @@ using Clock = std::chrono::steady_clock;
 // 350ms/act ≈ 7 秒一局，而平台打榜要对榜内每个对手各打 20 局。
 // 降到 150ms 后约 3 秒一局，搜索深度只浅一点——性价比更高。
 // phase① 的穷举搜索只需几百微秒，根本用不到这个预算。
-constexpr int kDefaultBudgetMs = 150;
+// 【400 = 实测最优】搜索时间翻倍让 refine 完成更多叶：vs baseline 0.753 ->
+// 0.763、vs hunter 显著组合增益。时耗核算：400ms/act × 最坏 50 act =
+// 20s < 30s 平台单局限额，600 局实测零超时。
+constexpr int kDefaultBudgetMs = 400;
 constexpr int kMaxFailedAttempts = 4;
 
 int env_int(const char* name, int fallback) {
