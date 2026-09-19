@@ -36,10 +36,13 @@ using Clock = std::chrono::steady_clock;
 // 350ms/act ≈ 7 秒一局，而平台打榜要对榜内每个对手各打 20 局。
 // 降到 150ms 后约 3 秒一局，搜索深度只浅一点——性价比更高。
 // phase① 的穷举搜索只需几百微秒，根本用不到这个预算。
-// 【400 = 实测最优】搜索时间翻倍让 refine 完成更多叶：vs baseline 0.753 ->
-// 0.763、vs hunter 显著组合增益。时耗核算：400ms/act × 最坏 50 act =
-// 20s < 30s 平台单局限额，600 局实测零超时。
-constexpr int kDefaultBudgetMs = 400;
+// 【必须 ≤150ms】平台的 timeout=30s 是**整个对局子进程**的时限，含对手
+// 的思考时间。本地对局测不出这个坑：baseline/hunter 思考 ≈0s，但平台
+// 对手是别人的 AI——400ms/act 时我方 ~24s + 对手思考时间会撞爆 30s，
+// 子进程被杀 = 整局判负（实测：combo 包上线排名掉一名）。
+// 150ms × 两 AI × 最坏 60 act ≈ 18s，留足余量。600 局验证的调优收益
+// （w_ready=0.6）全部来自这个预算档，不要动。
+constexpr int kDefaultBudgetMs = 150;
 constexpr int kMaxFailedAttempts = 4;
 
 int env_int(const char* name, int fallback) {
