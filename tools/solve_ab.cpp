@@ -36,7 +36,9 @@
 #include <cstdlib>
 #include <random>
 #include <string>
+#include <array>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -208,11 +210,15 @@ int search(const sim::State& s0, char side, int ac, bool free_r, bool free_b, in
             diff + (es.sentry_for(side).score - before) * (side == 'R' ? 1 : -1);
         if (side == 'R') {
             evaluate_child(es, (side == 'R') ? 'B' : 'R', 0, free_r, free_b, ediff, 254);
+            // 子节点全等于悲观初值（v=-1 不满足严格大于）时 best_move 仍是
+            // 255——回填为收手，保证每个节点都有可执行的最优手记录
+            if (best_move == 255) best_move = 254;
         } else {
             sim::State rs = es;
             if (turn + 1 < kTurnN) {
                 sim::end_round(rs);
                 evaluate_child(rs, 'R', 0, free_r, free_b, ediff, 254);
+                if (best_move == 255) best_move = 254;
             } else {
                 const int v = terminal_value(ediff);
                 if (v < best) { best = v; best_move = 254; }
@@ -558,6 +564,8 @@ int main(int argc, char** argv) {
     const char* strategy_path = nullptr;
     int strategy_games = 300;
     double strategy_eps = 0.05;
+    const char* book_path = nullptr;
+    int book_turns = 3;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--from-turn") == 0 && i + 1 < argc) {
             from_turn = std::atoi(argv[++i]);
@@ -579,6 +587,10 @@ int main(int argc, char** argv) {
             strategy_games = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--strategy-eps") == 0 && i + 1 < argc) {
             strategy_eps = std::atof(argv[++i]);
+        } else if (std::strcmp(argv[i], "--opening-book") == 0 && i + 1 < argc) {
+            book_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--book-turns") == 0 && i + 1 < argc) {
+            book_turns = std::atoi(argv[++i]);
         }
     }
     g_max_turn = 25;
@@ -764,6 +776,185 @@ int main(int argc, char** argv) {
         teacher::run(teacher_prefix ? teacher_prefix : "",
                      teacher_games, teacher_eps, from_turn,
                      strategy_path, strategy_games, strategy_eps);
+    }
+
+    // —— 开局书：turn < N 的可达状态最优手，紧凑表可直接编译进 .so ——
+    // turn 0-2 双方位置确定（都在出生点），全知 = 部分信息，书是精确的。
+    if (book_path != nullptr) {
+        std::printf("\n开局书: turn <%d 的可达状态 → %s\n", book_turns, book_path);
+        std::fflush(stdout);
+        // BFS 收集 turn < book_turns 的可访问状态（只关心有 best 的）
+        std::vector<std::uint64_t> book_keys;
+        std::unordered_set<std::uint64_t> bseen;
+        // 【同 teacher 的教训】必须从主求解的起始回合出发——make_initial_state()
+        // 的 turn=0 会让书里的键与主求解的键零交集（miss=全部）。
+        sim::State init2 = init; // init.turn 已 = from_turn
+        const int pr0 = encode_pose(init2.red), pb0 = encode_pose(init2.blue);
+        // 队列元素 = (pr, pb, turn, side, ac, freef, diff)
+        std::vector<std::array<long long, 7>> q;
+        auto push_state = [&](int pr, int pb, int tn, int sidx, int acx, int ffx,
+                              int ddx) {
+            const std::uint64_t k =
+                make_key(pr, pb, tn, sidx, acx, ffx, ddx);
+            if (bseen.insert(k).second) {
+                q.push_back({pr, pb, tn, sidx, acx, ffx, ddx});
+            }
+        };
+        push_state(pr0, pb0, from_turn, 0, 0, 3, 0);
+        for (std::size_t qi = 0; qi < q.size(); ++qi) {
+            const auto st_ = q[qi];
+            const int tn = static_cast<int>(st_[2]);
+            if (tn >= from_turn + book_turns - 1) continue; // 后继会超出书范围
+            const int pr = static_cast<int>(st_[0]), pb = static_cast<int>(st_[1]);
+            const int sidx = static_cast<int>(st_[3]);
+            const int acx = static_cast<int>(st_[4]);
+            const int ffx = static_cast<int>(st_[5]);
+            const int ddx = static_cast<int>(st_[6]);
+            const char side = sidx == 0 ? 'R' : 'B';
+            const bool free_r = (ffx & 2) != 0, free_b = (ffx & 1) != 0;
+            const bool ft = (side == 'R') ? free_r : free_b;
+            sim::State s0 = init2;
+            apply_pose(pr, s0.red);
+            apply_pose(pb, s0.blue);
+            s0.turn = tn;
+            auto emit = [&](const sim::State& ns, int nac, bool nfr, bool nfb,
+                            int nv, int ntn, int nsidx) {
+                const int np_r = encode_pose(ns.red), np_b = encode_pose(ns.blue);
+                if (np_r < 0 || np_b < 0) return;
+                push_state(np_r, np_b, ntn, nsidx, nac, (nfr ? 2 : 0) | (nfb ? 1 : 0),
+                           nv);
+            };
+            // 我方/当前方动作
+            std::vector<Move> mv;
+            gen_moves(s0, side, mv);
+            for (const Move& m : mv) {
+                sim::State ns = s0;
+                int used = acx;
+                bool ft2 = ft;
+                bool hit = false;
+                const brain::Cand wc = brain::local_to_world({m.action, m.arg}, side);
+                if (!brain::apply_step(ns, side, wc, used, ft2, &hit)) continue;
+                const int nv = ddx + (hit ? (side == 'R' ? 2 : -2) : 0);
+                bool nfr = (side == 'R') ? ft2 : free_r;
+                bool nfb = (side == 'B') ? ft2 : free_b;
+                if (hit) { if (side == 'R') nfb = true; else nfr = true; }
+                emit(ns, used, nfr, nfb, nv, tn, sidx);
+            }
+            // 对手在剩余状态上也可能行动（书要覆盖我方查询点：只存我方查询
+            // 时会用到的 side——两种都存，部署时按 side 取）
+            sim::State es = s0;
+            const int before = es.sentry_for(side).score;
+            sim::end_side_turn(es, side);
+            const int ediff =
+                ddx + (es.sentry_for(side).score - before) * (side == 'R' ? 1 : -1);
+            if (side == 'R') {
+                emit(es, 0, free_r, free_b, ediff, tn, 1);
+            } else if (tn + 1 < kTurnN) {
+                sim::State rs = es;
+                sim::end_round(rs);
+                emit(rs, 0, free_r, free_b, ediff, tn + 1, 0);
+            }
+        }
+
+        // 写出：key 字段 + best（跳过无 best 的）
+        std::FILE* fb = std::fopen(book_path, "wb");
+        if (fb == nullptr) {
+            std::fprintf(stderr, "开局书: 打不开输出 %s\n", book_path);
+            return 1;
+        }
+        const std::uint32_t bt = static_cast<std::uint32_t>(book_turns);
+        std::fwrite(&bt, sizeof(bt), 1, fb);
+        long long book_n = 0, book_skip = 0, miss = 0, hit255 = 0;
+        for (const auto& k : bseen) {
+            const auto it = g_tt.find(k);
+            if (it == g_tt.end()) { ++miss; ++book_skip; continue; }
+            if (it->second.best == 255) { ++hit255; ++book_skip; continue; }
+            std::uint64_t kt = k;
+            const int kdd = static_cast<int>(kt % kDiffN) - kDiffMax; kt /= kDiffN;
+            const int kff = static_cast<int>(kt % 4); kt /= 4;
+            const int kac = static_cast<int>(kt % 4); kt /= 4;
+            const int ksidx = static_cast<int>(kt % 2); kt /= 2;
+            const int ktn = static_cast<int>(kt % kTurnN);
+            const int kpair = static_cast<int>(kt / kTurnN);
+            const int kpr = kpair / kPoses, kpb = kpair % kPoses;
+            if (terminal_of(ktn, kdd)) { ++book_skip; continue; }
+            // best 缺失（子节点全等于悲观初值时不记录）→ 现算 argmax
+            if (it->second.best == 255) {
+                sim::State s0 = init2;
+                apply_pose(kpr, s0.red);
+                apply_pose(kpb, s0.blue);
+                s0.turn = ktn;
+                const char side = ksidx == 0 ? 'R' : 'B';
+                const bool free_r = (kff & 2) != 0, free_b = (kff & 1) != 0;
+                const bool ft = (side == 'R') ? free_r : free_b;
+                std::vector<Move> mv;
+                gen_moves(s0, side, mv);
+                int arg_v = (side == 'R') ? -2 : 2, arg_i = 255;
+                const auto consider = [&](const sim::State& ns, int nv, int nsidx) {
+                    const int np_r = encode_pose(ns.red), np_b = encode_pose(ns.blue);
+                    if (np_r < 0 || np_b < 0) return;
+                    const auto c2 = g_tt.find(make_key(np_r, np_b, nv >= -1000 ? ns.turn : ns.turn,
+                                                       nsidx, 0, 0, nv));
+                    if (c2 == g_tt.end()) return;
+                    const int v = c2->second.value;
+                    if (side == 'R' ? (v > arg_v) : (v < arg_v)) { arg_v = v; arg_i = nsidx; }
+                };
+                for (std::size_t i = 0; i < mv.size(); ++i) {
+                    sim::State ns = s0;
+                    int used2 = kac;
+                    bool ft2 = ft;
+                    bool hit = false;
+                    const brain::Cand wc =
+                        brain::local_to_world({mv[i].action, mv[i].arg}, side);
+                    if (!brain::apply_step(ns, side, wc, used2, ft2, &hit)) continue;
+                    const int nv = kdd + (hit ? (side == 'R' ? 2 : -2) : 0);
+                    bool nr = (side == 'R') ? ft2 : free_r;
+                    bool nb2 = (side == 'B') ? ft2 : free_b;
+                    if (hit) { if (side == 'R') nb2 = true; else nr = true; }
+                    consider(ns, nv, static_cast<int>(i));
+                }
+                if (arg_i == 255) { ++book_skip; continue; }
+                unsigned char rec2[9] = {
+                    static_cast<unsigned char>(kpr & 0xFF),
+                    static_cast<unsigned char>((kpr >> 8) & 0xFF),
+                    static_cast<unsigned char>(kpb & 0xFF),
+                    static_cast<unsigned char>((kpb >> 8) & 0xFF),
+                    static_cast<unsigned char>(ktn),
+                    static_cast<unsigned char>(ksidx),
+                    static_cast<unsigned char>(kac),
+                    static_cast<unsigned char>(kff),
+                    static_cast<unsigned char>(arg_i),
+                };
+                std::fwrite(rec2, 1, 9, fb);
+                ++book_n;
+                continue;
+            }
+            std::uint64_t t = k;
+            const int dd = static_cast<int>(t % kDiffN) - kDiffMax; t /= kDiffN;
+            const int ffx = static_cast<int>(t % 4); t /= 4;
+            const int acx = static_cast<int>(t % 4); t /= 4;
+            const int sidx = static_cast<int>(t % 2); t /= 2;
+            const int tn = static_cast<int>(t % kTurnN);
+            const int pair = static_cast<int>(t / kTurnN);
+            const int pr = pair / kPoses, pb = pair % kPoses;
+            unsigned char rec[9] = {
+                static_cast<unsigned char>(pr & 0xFF),
+                static_cast<unsigned char>((pr >> 8) & 0xFF),
+                static_cast<unsigned char>(pb & 0xFF),
+                static_cast<unsigned char>((pb >> 8) & 0xFF),
+                static_cast<unsigned char>(tn),
+                static_cast<unsigned char>(sidx),
+                static_cast<unsigned char>(acx),
+                static_cast<unsigned char>(ffx),
+                static_cast<unsigned char>(it->second.best),
+            };
+            std::fwrite(rec, 1, 9, fb);
+            ++book_n;
+        }
+        std::fclose(fb);
+        std::printf("  开局书完成: %lld 条 (miss %lld, best255 %lld)\n",
+                    book_n, miss, hit255);
+        std::fflush(stdout);
     }
 
     const char* name[] = {"红负", "平", "红胜"};
