@@ -15,6 +15,7 @@
 #include "brain/eval.h"
 #include "brain/mcts.h"
 #include "brain/net.h"
+#include "brain/opening_book.h"
 #include "brain/policy_net.h"
 #include "brain/search.h"
 #include "obs/encode_v3.h"
@@ -211,6 +212,87 @@ Executed execute(int action, char world_arg) {
     }
     return e;
 }
+
+// ── 开局书查表 ──
+// 书键是世界坐标的求解器状态。部署时 Board 在局部帧（蓝方已镜像），
+// 需要转回世界帧再编码查表。开局期 (turn<4) 双方位置公开，无信息缺口。
+int book_action(const Board& board, char my_color, int used, bool free_turn) {
+    if (!brain::book_available() || board.turn >= brain::book_turns()) return -1;
+    const bool i_am_red = (my_color == 'R');
+
+    // 局部帧 → 世界帧：蓝方镜像（mirror 自反）
+    const auto to_world_pos = [&](const Pos& p) -> Pos {
+        return i_am_red ? p : sim::mirror_pos(p, board.size);
+    };
+    const auto to_world_f = [&](char f) -> char {
+        return i_am_red ? f : sim::mirror_facing(f);
+    };
+
+    const Sentry& my_s = i_am_red ? board.red : board.blue;
+    const Sentry& opp_s = i_am_red ? board.blue : board.red;
+
+    const auto encode = [&](const Pos& p, char f, int fcd, int scd) -> int {
+        const int cell = p.y * 7 + p.x;
+        int fi = 0;
+        for (int i = 0; i < 4; ++i) { if ("NESW"[i] == f) fi = i; }
+        return ((cell * 4 + fi) * 12) + (fcd * 4 + scd);
+    };
+
+    const int pr = encode(to_world_pos(my_s.last_known_pos),
+                          to_world_f(my_s.last_known_facing),
+                          my_s.fire_cd, my_s.scan_cd);
+    const int pb = encode(to_world_pos(opp_s.last_known_pos),
+                          to_world_f(opp_s.last_known_facing),
+                          opp_s.fire_cd, opp_s.scan_cd);
+    const int sidx = i_am_red ? 0 : 1;
+    const int ff = (free_turn && i_am_red ? 2 : 0) | (free_turn && !i_am_red ? 1 : 0);
+    const int diff = board.red.score - board.blue.score;
+
+    const int best = brain::book_lookup(pr, pb, board.turn, sidx, used, ff, diff);
+    if (best < 0) return -1;
+    // best 是 solver 的动作下标（gen_moves 序：move/turn×3/fire/scan）
+    // 或 254（收手）。转成 brain::kActionDim 空间。
+    if (best == 254) return 7;
+    // gen_moves 序: 0=move, 1..3=turn（跳过当前朝向）, 4=fire, 5=scan
+    // brain 动作序: 0=move, 1..4=turn NESW, 5=fire, 6=scan, 7=stop
+    // 需要从世界帧的动作反查局部帧的动作。
+    // 因为 solver 用世界帧朝向而部署用局部帧朝向，转向的映射不同。
+    // 简化：书条目只记录了下标——重新从 gen_moves 恢复动作。
+    // 这里直接用 cand_to_index 反查不可靠（序不同），改为重新枚举。
+    // gen_moves 序与 solve 的相同：按当前朝向剔除同向转向。
+    // 行动方的朝向来自 Board（局部帧），但 solver 的 gen_moves 也是局部帧的
+    // （Board 的朝向就是局部帧朝向），所以直接枚举即可。
+    {
+        // 行动方的朝向（局部帧）：找当前 acting side 的朝向
+        const char acting_facing = i_am_red ? board.red.last_known_facing
+                                            : board.blue.last_known_facing;
+        std::vector<std::pair<int, char>> seq = {
+            {0, 0}, {1, 'N'}, {1, 'E'}, {1, 'S'}, {1, 'W'}, {2, 0}, {3, 0}};
+        int j = 0;
+        for (int i = 0; i < static_cast<int>(seq.size()); ++i) {
+            if (seq[i].first == 1 && seq[i].second == acting_facing) continue;
+            if (j == best) {
+                // solver 的动作 → brain 动作下标。
+                // move/fire/scan 是同动作。turn 的 arg（世界帧方向）需要
+                // 转回局部帧：蓝方时 N↔S、E↔W 对调。
+                const brain::Cand wc{seq[i].first, seq[i].second};
+                if (seq[i].first == sim::kTurn && !i_am_red) {
+                    // 蓝方的局部帧朝向 = 世界帧朝向的镜像
+                    char lf = seq[i].second;
+                    if (lf == 'N') lf = 'S'; else if (lf == 'S') lf = 'N';
+                    else if (lf == 'E') lf = 'W'; else if (lf == 'W') lf = 'E';
+                    const brain::Cand lc{sim::kTurn, lf};
+                    return brain::cand_to_index(lc);
+                }
+                return brain::cand_to_index(wc);
+            }
+            ++j;
+        }
+    }
+    return -1;
+}
+
+char side_from_idx(int idx) { return idx == 0 ? 'R' : 'B'; }
 
 void run(const Board& board, char my_color) {
     const Clock::time_point deadline = Clock::now() + std::chrono::milliseconds(g_budget_ms);
