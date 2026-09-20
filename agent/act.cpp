@@ -17,6 +17,7 @@
 #include "brain/net.h"
 #include "brain/opening_book.h"
 #include "brain/policy_net.h"
+#include "brain/ab_search.h"
 #include "brain/search.h"
 #include "obs/encode_v3.h"
 #include "sim/belief.h"
@@ -92,6 +93,7 @@ const bool g_use_value_net = env_flag("ST_VALUE_NET");
 const double g_value_scale = env_double("ST_VALUE_SCALE", 30.0);
 // 两回合前瞻（深模式）。ST_DEEP=1 启用，ST_DEEP_NODES 调预算。
 const int g_deep_turns = env_int("ST_DEEP", 0);
+const bool g_use_ab = env_flag("ST_SEARCH_AB");
 
 // 对手建模开关。【默认关】dfs_opp 的对手建模低估了危险（scan→fire 在
 // 搜索中不可见），不完整的 minimax 比纯 eval 贪心更差——实测去掉后
@@ -379,7 +381,9 @@ void run(const Board& board, char my_color) {
 
         brain::SearchStats stats;
         brain::Plan plan;
-        if (g_use_policy) {
+        if (g_use_ab) {
+            plan = brain::ab_search_turn(in, g_weights, deadline, &stats);
+        } else if (g_use_policy) {
             // 策略网络直接出动作：obs v3 → GRU → argmax
             float obs_v3[obs::kObsDimV3];
             obs::encode_v3(st, enemy_visible, used, free_turn, obs_v3);
