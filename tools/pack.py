@@ -55,6 +55,8 @@ FILES: list[tuple[str, str]] = [
     ("brain/policy_net.cpp", "brain/policy_net.cpp"),
     ("brain/value_net.h", "brain/value_net.h"),
     ("brain/value_net.cpp", "brain/value_net.cpp"),
+    ("brain/opening_book.h", "brain/opening_book.h"),
+    ("brain/opening_book.cpp", "brain/opening_book.cpp"),
     ("obs/encode_v3.h", "obs/encode_v3.h"),
     ("obs/encode_v3.cpp", "obs/encode_v3.cpp"),
     ("sim/view_mirror.h", "sim/view_mirror.h"),
