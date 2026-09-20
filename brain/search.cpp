@@ -3,6 +3,7 @@
 #include "brain/value_net.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <vector>
 
 namespace brain {
@@ -280,8 +281,11 @@ Plan search_turn(const TurnInput& in, const Weights& w, const Deadline& deadline
     std::sort(leaves.begin(), leaves.end(),
               [](const Leaf& a, const Leaf& b) { return a.value > b.value; });
 
-    const int top_k = std::min<int>(static_cast<int>(leaves.size()), kRefineTopK);
+    const bool do_opp_model = in.do_opp_model;
+    const int top_k = std::min<int>(static_cast<int>(leaves.size()),
+                                    do_opp_model ? kRefineTopK : static_cast<int>(leaves.size()));
     int refined = 0;
+    if (do_opp_model) {
     for (int i = 0; i < top_k; ++i) {
         if (out_of_time(deadline)) {
             st.time_exhausted = true;
@@ -292,6 +296,7 @@ Plan search_turn(const TurnInput& in, const Weights& w, const Deadline& deadline
                           in.use_value_net, in.value_scale,
                           in.opp_defenseless_until, deadline, st, in.deep_turns);
         ++refined;
+    }
     }
     st.refined = refined;
 

@@ -93,6 +93,11 @@ const double g_value_scale = env_double("ST_VALUE_SCALE", 30.0);
 // 两回合前瞻（深模式）。ST_DEEP=1 启用，ST_DEEP_NODES 调预算。
 const int g_deep_turns = env_int("ST_DEEP", 0);
 
+// 对手建模开关。默认开（minimax）。关闭时叶子用纯 eval 贪心选择，
+// 不跑 dfs_opp 对手回应层——当 dfs_opp 低估对手威胁时（scan+fire 不可见），
+// 不完整的 minimax 可能比贪心更差。
+const bool g_do_opp_model = !env_flag("ST_NO_OPP_MODEL");
+
 double env_double(const char* name, double fallback); // 定义见下方
 
 brain::MctsConfig load_mcts_config() {
@@ -370,6 +375,7 @@ void run(const Board& board, char my_color) {
         in.use_value_net = g_use_value_net;
         in.value_scale = g_value_scale;
         in.deep_turns = g_deep_turns;
+        in.do_opp_model = g_do_opp_model;
 
         brain::SearchStats stats;
         brain::Plan plan;

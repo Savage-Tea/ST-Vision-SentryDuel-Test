@@ -56,6 +56,8 @@ struct TurnInput {
     double value_scale = 30.0;
     // 两回合前瞻（深模式）。0 = 关闭；1 = 在对手回应之后再看一轮我方+对手。
     int deep_turns = 0;
+    // 对手建模开关：true = minimax（默认），false = 纯 eval 贪心（无对手回应层）
+    bool do_opp_model = true;
     // 对手"刚刚开过火、正处在 CD 无力期"的推断：被击中时，打我们的人必然
     // 刚开火。引擎不暴露对手 CD（观测恒 -1，默认保守假设随时可开火），
     // 但这次击中本身泄露了信息。窗口按 CD 时序不对称折算：
