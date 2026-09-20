@@ -100,6 +100,11 @@ void dfs_opp(const sim::State& s, const sim::Belief& b, int used, bool free_turn
     {
         sim::State after = s;
         sim::end_side_turn(after, 'B');
+        // 【关键】end_round：CD 递减 + 回合推进。没有这一步，叶子评估
+        // 永远看到"本回合末"的 CD 值——对手开了火 fire_cd=2，eval 以为
+        // 要等 2 回合，实际 end_round 后只等 1 回合。turn 也永不推进，
+        // 搜索看不到 turn≥20 的终局判断。
+        sim::end_round(after);
         worst = std::min(worst, leaf_eval(after, b, w, acts_first, use_vnet, vscale,
                                           used, /*opp_to_move=*/false,
                                           sim::is_at_spawn(after, 'R')));
