@@ -45,11 +45,13 @@ struct TTE {
     int depth;
     std::uint8_t flag; // 0=exact, 1=lower, 2=upper
 };
-constexpr std::size_t kTTMask = (1 << 20) - 1; // 1M 槽
-std::vector<TTE> g_tt(kTTMask + 1, {0, 0.0, 0, 0});
-std::vector<bool> g_tt_used(kTTMask + 1, false);
+// 64k 槽——.so 里分配过多内存在某些环境下会导致段错误
+constexpr std::size_t kTTSize = 1 << 16; // 64k 槽
+std::vector<TTE> g_tt(kTTSize, {0, 0.0, 0, 0});
+std::vector<bool> g_tt_used(kTTSize, false);
 
-inline std::size_t tt_idx(std::uint64_t key) { return key & kTTMask; }
+inline std::size_t tt_idx(std::uint64_t key) { return key % kTTSize; }
+
 
 // ── 状态键 ──
 std::uint64_t make_key(const sim::State& s, int side, int ac, bool fr, bool fb) {
@@ -89,11 +91,9 @@ double ab_rec(const sim::State& s, int side, int ac, bool fr, bool fb,
     }
 
     // 置换表
-    const auto key = make_key(s, side, ac, fr, fb);
-    const auto idx = tt_idx(key);
-    if (g_tt_used[idx] && g_tt[idx].key == key && g_tt[idx].depth >= depth) {
-        return g_tt[idx].score;
-    }
+    // TT 暂禁（调试）
+    // const auto key = make_key(s, side, ac, fr, fb);
+    // const auto idx = tt_idx(key);
 
     const char side_c = side == 0 ? 'R' : 'B';
     const bool my_free = (side == 0) ? fr : fb;
@@ -153,8 +153,8 @@ double ab_rec(const sim::State& s, int side, int ac, bool fr, bool fb,
         }
     }
 
-    g_tt[idx] = {key, best, depth, 0};
-    g_tt_used[idx] = true;
+    // g_tt[idx] = {key, best, depth, 0};
+    // g_tt_used[idx] = true;
     return best;
 }
 
