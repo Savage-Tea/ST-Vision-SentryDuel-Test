@@ -18,7 +18,7 @@ SRC = my_ai.cpp \
       sim/rules.cpp sim/belief.cpp sim/view_mirror.cpp \
       brain/eval.cpp brain/actions.cpp brain/search.cpp \
       brain/mcts.cpp brain/belief_state.cpp brain/net.cpp \
-      brain/policy_net.cpp brain/value_net.cpp brain/opening_book.cpp \
+      brain/policy_net.cpp brain/value_net.cpp brain/opening_book.cpp brain/ab_search.cpp \
       obs/encode.cpp obs/encode_v3.cpp
 
 all: my_ai.so
