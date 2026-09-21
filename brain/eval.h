@@ -14,15 +14,42 @@
 
 namespace brain {
 
+// 每个权重的编译期默认值都留了一个 -D 覆盖点（SD_W_*）。
+// 用途：**风格池**。运行时环境变量 ST_W_* 在引擎里是进程级共享的
+// （红蓝两个 .so 在同一个进程里 dlopen），没法只给对手一侧设值；
+// 要造一个"风格不同的对手"就得把权重烘进它自己的 .so。
+// tools/build_variants.sh 用这些宏批量产出变体。
+#ifndef SD_W_DIFF
+#define SD_W_DIFF 1.00
+#endif
+#ifndef SD_W_ZONE
+#define SD_W_ZONE 0.80
+#endif
+#ifndef SD_W_DIST
+#define SD_W_DIST 0.40
+#endif
+#ifndef SD_W_THREAT
+#define SD_W_THREAT 0.40
+#endif
+#ifndef SD_W_DANGER
+#define SD_W_DANGER 2.00
+#endif
+#ifndef SD_W_READY
+#define SD_W_READY 0.45
+#endif
+#ifndef SD_W_UNCERTAIN
+#define SD_W_UNCERTAIN 0.75
+#endif
+
 // 评估权重。战略核心不是"我打中了吗"，而是**占点时间差 + 剥夺对手占点时间**：
 // 得分区 5 格且双方各自结算，占点是稳定 +1/回合；击杀的 +2 只是小头，
 // 真正的大价值是把对手打回出生点、让他 3-4 个回合拿不到占点分。
 struct Weights {
-    double w_diff = 1.00;    // 分差（已含本回合我方占点分）
-    double w_zone = 0.80;    // 当前位于得分区（未来价值：下回合大概率还能 +1）
-    double w_dist = 0.40;    // 距得分区的距离优势（每格）
-    double w_threat = 0.40;  // 对手在我火力通道内（我下回合可击杀）
-    double w_danger = 2.00;  // 我在对手火力通道内（下回合会被击杀）
+    double w_diff = SD_W_DIFF;    // 分差（已含本回合我方占点分）
+    double w_zone = SD_W_ZONE;    // 当前位于得分区（未来价值：下回合大概率还能 +1）
+    double w_dist = SD_W_DIST;    // 距得分区的距离优势（每格）
+    double w_threat = SD_W_THREAT; // 对手在我火力通道内（我下回合可击杀）
+    double w_danger = SD_W_DANGER; // 我在对手火力通道内（下回合会被击杀）
     // 【0.6 = 实测最优】网格扫描 + 600 局验证（2026-09-19）：
     // 0.3 → vs hunter 0.703；0.6 → vs hunter 0.757（红 75.3%，最强红数据）。
     // 代价是对 baseline 0.753 -> 0.730（余量仍足）。取舍方向对准平台暴露的
@@ -35,7 +62,7 @@ struct Weights {
     // 【0.45 = 实测最优】中点+ready0.45 配置（2026-09-20 200 局验证）：
     // 4 象限全赢：baseline 红 49%/蓝 100%，hunter 红 75%/蓝 77%。
     // 双色双对手全过的唯一配置。
-    double w_ready = 0.45;   // 我方火力就绪
+    double w_ready = SD_W_READY;   // 我方火力就绪
     // 行动是有限资源（每回合 3 次）。这一项很小，只用来打破"浪费行动"
     // 与"不浪费"之间的平局——没有它，搜索会选出 TURN 来 TURN 去这类
     // 状态不变却照常消耗额度的方案（它们的评估值与什么都不做完全相同）。
@@ -47,7 +74,7 @@ struct Weights {
     //   0.25 → vs baseline 0.500（蓝 0%）、vs hunter 0.400
     //   0.75 → vs baseline 0.753（蓝 50.7%）、vs hunter 0.703
     // "看不见的危险"近乎全额计入后，走廊盲死循环消失。
-    double w_uncertain = 0.75;
+    double w_uncertain = SD_W_UNCERTAIN;
 
     // CD 时序不对称（#14 的机制）：引擎的 CD 递减只发生在蓝方阶段后，
     // 同样一枪红方要熬 3 个相位、蓝方 1 个；对手可乘虚窗口红 2 蓝 1。

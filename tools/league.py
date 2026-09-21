@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import hashlib
 import json
 import os
 import re
@@ -42,6 +43,7 @@ def play(red: Path, blue: Path, max_turns: int) -> dict:
         "red_timeouts": 0, "blue_timeouts": 0,
         "stderr": proc.stderr,
     }
+    actions: list[str] = []
     for line in proc.stdout.splitlines():
         line = line.strip()
         if not line:
@@ -56,6 +58,13 @@ def play(red: Path, blue: Path, max_turns: int) -> dict:
                 red_score=event["red_score"], blue_score=event["blue_score"],
                 turns=event["turns"],
             )
+        elif event.get("type") == "action":
+            # 轨迹指纹：两个 AI 都是确定性的，同一个指纹 = 同一局棋。
+            # 没有它，"2000 局"可能其实只是同一局跑了两千遍（实测踩过：
+            # vs det_ai_a 的 2000 局是 1 种对局，vs baseline 是 2 种）。
+            actions.append(f"{event.get('turn')},{event.get('side')},"
+                           f"{event.get('action')},{int(bool(event.get('success')))}")
+    result["trace"] = hashlib.md5("|".join(actions).encode()).hexdigest()[:8]
     for side in TIMEOUT_RE.findall(proc.stderr):
         result[f"{side}_timeouts"] += 1
     return result
@@ -94,6 +103,8 @@ def main() -> int:
     stats = {"R": {"wins": 0, "draws": 0, "losses": 0, "margin": 0},
              "B": {"wins": 0, "draws": 0, "losses": 0, "margin": 0}}
 
+    traces: dict[str, int] = {}
+    margins: dict[int, int] = {}
     for (_, _, a_is_red), g in zip(schedule, raw):
         if g["returncode"] != 0 or g["winner"] is None:
             crashes += 1
@@ -105,6 +116,9 @@ def main() -> int:
 
         a_score = g["red_score"] if a_is_red else g["blue_score"]
         b_score = g["blue_score"] if a_is_red else g["red_score"]
+
+        traces[g["trace"]] = traces.get(g["trace"], 0) + 1
+        margins[a_score - b_score] = margins.get(a_score - b_score, 0) + 1
 
         st = stats["R" if a_is_red else "B"]
         st["margin"] += a_score - b_score
@@ -145,6 +159,10 @@ def main() -> int:
         "by_color": {c: {k: v for k, v in d.items() if k != "margin"}
                      for c, d in by_color.items()},
         "color_gap": color_gap,
+        # 有效样本：不同对局数 / 净胜分取值。得分率必须和它们一起看。
+        "distinct_games": len(traces),
+        "margin_values": len(margins),
+        "margins": {str(k): v for k, v in sorted(margins.items())},
         "a_timeouts": a_timeouts, "b_timeouts": b_timeouts, "crashes": crashes,
         "reasons": reasons,
     }
@@ -164,6 +182,18 @@ def main() -> int:
         print(f"  ⚠ 颜色严重不对称：执红 {by_color['R']['score_rate']:.4f}"
               f" vs 执蓝 {by_color['B']['score_rate']:.4f}（差 {color_gap:.4f}）"
               f"—— 聚合数字会掩盖这件事，别只看上面那行")
+    # 有效样本。**必须报**：双方都确定性时，N 局可能只是同一局跑了 N 遍，
+    # 此时得分率是个离散取值，不是统计量，标准误无从谈起。
+    print(f"  有效样本：{played} 局 = {len(traces)} 种不同的对局"
+          f"（净胜分 {len(margins)} 种取值）")
+    if len(traces) <= 4:
+        top = "  ".join(f"{c} 局" for c in sorted(traces.values(), reverse=True))
+        print(f"    ⚠ 确定性对局，真实信息量约 {len(traces)} 局，"
+              f"得分率只在这几个结局上取值 —— 不要当统计量用")
+        print(f"    各结局出现次数：{top}")
+    if len(margins) <= 8:
+        print(f"    净胜分分布：{dict(sorted(margins.items()))}")
+
     print(f"  A 超时 {a_timeouts}   B 超时 {b_timeouts}   异常退出 {crashes}")
     print(f"  结束原因 {reasons}")
 

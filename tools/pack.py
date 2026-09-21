@@ -12,11 +12,15 @@
   my_ai.cpp             ← agent/act.cpp 的副本
   Makefile              ← tools/pack_Makefile
   sim/ brain/           ← 原样拷贝（include 路径不变）
-并打成 build/upload/my_ai_pack.zip。
+默认打成 build/upload/my_ai_pack_<短哈希>_<日期>.zip。
+
+【绝不覆盖】包名带版本信息，且目标已存在时直接报错。每一版打到平台上都要留下对照，
+覆盖掉旧包等于丢掉实验记录。要另起名字用 --out。
 """
 from __future__ import annotations
 
 import argparse
+import datetime
 import shutil
 import subprocess
 import sys
@@ -24,8 +28,28 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-STAGE = ROOT / "build" / "upload" / "pack"
-ZIP_PATH = ROOT / "build" / "upload" / "my_ai_pack.zip"
+UPLOAD_DIR = ROOT / "build" / "upload"
+STAGE = UPLOAD_DIR / "pack"
+
+
+def _git(*args: str) -> str:
+    try:
+        return subprocess.run(["git", *args], cwd=ROOT, capture_output=True,
+                              text=True, check=True).stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return ""
+
+
+def default_name() -> str:
+    """默认包名 = my_ai_pack_<短哈希>[_dirty]_<日期>.zip
+
+    只把**会进包的源文件**是否偏离 HEAD 当作 dirty 判据——pack.py 自身改了不算，
+    否则每次改打包脚本都会给一个内容完全相同的包盖上 dirty 戳。
+    """
+    sha = _git("rev-parse", "--short", "HEAD") or "nogit"
+    dirty = "-dirty" if _git("status", "--porcelain", "--",
+                             *[src for src, _ in FILES]) else ""
+    return f"my_ai_pack_{sha}{dirty}_{datetime.date.today().isoformat()}.zip"
 
 # (源文件, 包内路径)
 FILES: list[tuple[str, str]] = [
@@ -77,7 +101,15 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--verify", action="store_true",
                     help="打包后在本机模拟平台的编译流程并跑一局验证")
+    ap.add_argument("--out", default=None,
+                    help="输出文件名；默认 my_ai_pack_<短哈希>_<日期>.zip。"
+                         "目标已存在时报错，绝不覆盖")
     args = ap.parse_args()
+
+    zip_path = UPLOAD_DIR / (args.out or default_name())
+    if zip_path.exists():
+        sys.exit(f"❌ {zip_path.relative_to(ROOT)} 已存在——打包不覆盖历史包，"
+                 f"请用 --out 指定新名字")
 
     if STAGE.exists():
         shutil.rmtree(STAGE)
@@ -91,7 +123,7 @@ def main() -> int:
         d.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(s, d)
 
-    with zipfile.ZipFile(ZIP_PATH, "w", zipfile.ZIP_DEFLATED) as zf:
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for path in sorted(STAGE.rglob("*")):
             if path.is_file():
                 zf.write(path, path.relative_to(STAGE))
@@ -99,7 +131,7 @@ def main() -> int:
     members = [p for p in STAGE.rglob("*") if p.is_file()]
     total = sum(p.stat().st_size for p in members)
     biggest = max(members, key=lambda p: p.stat().st_size)
-    print(f"打包完成: {ZIP_PATH.relative_to(ROOT)}")
+    print(f"打包完成: {zip_path.relative_to(ROOT)}")
     print(f"  {len(members)} 个文件, 未压缩共 {total / 1024:.1f} KB, "
           f"最大单文件 {biggest.name} {biggest.stat().st_size / 1024:.1f} KB")
 
@@ -115,19 +147,19 @@ def main() -> int:
     print("  ✅ 满足平台限制（大小/文件数/主源码/Makefile）")
 
     if args.verify:
-        return verify()
+        return verify(zip_path)
     print("\n提示：加 --verify 可在本机模拟平台编译流程并跑一局")
     return 0
 
 
-def verify() -> int:
+def verify(zip_path: Path) -> int:
     """模拟平台：解压到干净目录 → make -C root（注入 ENGINE_*）→ 跑一局。"""
     print("\n=== 模拟平台编译 ===")
     work = ROOT / "build" / "upload" / "verify"
     if work.exists():
         shutil.rmtree(work)
     work.mkdir(parents=True)
-    with zipfile.ZipFile(ZIP_PATH) as zf:
+    with zipfile.ZipFile(zip_path) as zf:
         zf.extractall(work)
 
     import os
