@@ -12,6 +12,7 @@
 // 时间预算是硬约束：引擎给 1 秒，超时 = 本回合剩余行动作废 + 送对手 1 分。
 
 #include "brain/belief_state.h"
+#include "brain/value_net.h"
 #include "brain/eval.h"
 #include "brain/mcts.h"
 #include "brain/net.h"
@@ -119,11 +120,8 @@ const bool g_do_opp_model = env_flag("ST_OPP_MODEL");
 //
 // 换句话说：**当前这套权重是校准在"信念很模糊"这个前提下的**——信念一旦
 // 变准，整个权重向量同时失效。所以这条证据不能单独上线，必须先做 A-0
-// （把不确定性从"集合上的比例"换成稳定的概率语义）并重新校准。
-//
-// 所以这条证据不能单独上线：必须先把不确定性的语义从"集合上的比例"
-// 换成稳定的概率（见 brain/eval.h 的 threat_stats 说明），否则它只会
-// 把评估函数的定价错误暴露出来。
+// （把不确定性换成稳定概率语义）并重新校准；A-0 做完后实测仍是 0.6979，
+// 说明症结不在语义而在"权重拟合于信念的特定错误"。
 // ST_ZONE_EVIDENCE=1 可打开做 A/B；SD_ZONE_EVIDENCE=1 可烘进二进制
 // （做候选变体时必须烘——ST_ 环境变量在引擎进程里红蓝共享，用环境变量
 //  做对照会把对手的权重也一起改掉）。
@@ -143,6 +141,10 @@ const double g_leaf_noise = [] {
     const double s = v != nullptr ? std::atof(v) : static_cast<double>(SD_LEAF_NOISE);
     return s > 0.0 ? s : 0.0;
 }();
+
+// M1 采样开关：把决策点上的手写评估值与值网络特征打到 stderr。
+// 只在数据生成时开，线上不开。
+const bool g_dump_samples = env_flag("ST_DUMP_SAMPLES");
 
 double env_double(const char* name, double fallback); // 定义见下方
 
@@ -400,6 +402,26 @@ void run(const Board& board, char my_color) {
 
     // —— 敌方位置信念的维护（与自对弈侧共用 brain/SideBelief）——
     g_mem.belief.begin_turn(st, board.turn, enemy_visible, opp_occupied_zone);
+
+    // M1 采样（ST_DUMP_SAMPLES=1）：把决策点上的「手写评估值 + 值网络特征」
+    // 打到 stderr，由 tools/value_m1.py 与引擎的 game_over 分差拼成训练集。
+    // 目的是回答一个可证伪的问题：**学出来的 V 是不是比手写 evaluate() 更会
+    // 排序**。两者在同一个状态、同一份信念上取值，唯一差别是函数本身。
+    if (g_dump_samples) {
+        sim::State after = st;
+        sim::end_side_turn(after, 'R');   // 与搜索叶子的相位一致
+        const sim::Belief& bel = g_mem.belief.set;
+        float feats[brain::kValueObsDim];
+        brain::value_features(after, bel, /*me_to_move=*/false, free_turn,
+                              sim::is_at_spawn(after, 'B'), feats);
+        const double hv = brain::evaluate(after, g_weights, bel, my_color == 'R');
+        std::fprintf(stderr, "[sample] turn=%d side=%c vhand=%.6f f=",
+                     board.turn, my_color, hv);
+        for (int i = 0; i < brain::kValueObsDim; ++i) {
+            std::fprintf(stderr, "%s%.5f", i ? "," : "", feats[i]);
+        }
+        std::fprintf(stderr, "\n");
+    }
 
     if (g_debug && g_mem.belief.debug_miss != misses_before) {
         std::fprintf(stderr,
