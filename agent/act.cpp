@@ -90,8 +90,21 @@ const bool g_opp_window = env_flag("ST_OPP_WINDOW");
 
 // 值蒸馏叶评估（阶段③ → phase① 的成果回接）。ST_VALUE_NET=1 启用。
 double env_double(const char* name, double fallback); // 定义见下方
-const bool g_use_value_net = env_flag("ST_VALUE_NET");
-const double g_value_scale = env_double("ST_VALUE_SCALE", 30.0);
+// 值网络叶评估。同样要留编译期覆盖点：ST_* 在引擎进程里红蓝共享，
+// 用它做对照会把对手也切到值网络上，实验直接失效（见 SD_LEAF_NOISE 的说明）。
+// 训练脚本导出的网络输出的是**分差（点）**，所以配 SD_VALUE_SCALE=1.0。
+#ifndef SD_VALUE_NET
+#define SD_VALUE_NET 0
+#endif
+#ifndef SD_VALUE_SCALE
+#define SD_VALUE_SCALE 30.0
+#endif
+const bool g_use_value_net = env_flag("ST_VALUE_NET") || SD_VALUE_NET;
+const double g_value_scale = env_double("ST_VALUE_SCALE", SD_VALUE_SCALE);
+#ifndef SD_VALUE_BLEND
+#define SD_VALUE_BLEND 1.0
+#endif
+const double g_value_blend = env_double("ST_VALUE_BLEND", SD_VALUE_BLEND);
 // 两回合前瞻（深模式）。ST_DEEP=1 启用，ST_DEEP_NODES 调预算。
 const int g_deep_turns = env_int("ST_DEEP", 0);
 const bool g_use_ab = env_flag("ST_SEARCH_AB");
@@ -355,6 +368,7 @@ char side_from_idx(int idx) { return idx == 0 ? 'R' : 'B'; }
 void run(const Board& board, char my_color) {
     const Clock::time_point deadline = Clock::now() + std::chrono::milliseconds(g_budget_ms);
     brain::set_leaf_noise(g_leaf_noise);
+    brain::set_value_blend(g_value_blend);
 
     // 新对局：重置跨回合记忆（同进程只跑一局，这里是防御性写法）
     if (board.turn == 0 || board.turn < g_mem.last_turn) {

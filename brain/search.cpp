@@ -17,6 +17,8 @@ double g_leaf_noise = 0.0;
 std::uint32_t g_rng = 0;
 bool g_rng_seeded = false;
 
+double g_value_blend = 1.0;
+
 inline double leaf_noise() {
     if (g_leaf_noise <= 0.0) return 0.0;
     if (!g_rng_seeded) {
@@ -51,6 +53,12 @@ struct Leaf {
 double leaf_eval(const sim::State& after, const sim::Belief& b, const Weights& w,
                  bool acts_first, bool use_vnet, double vscale, int used,
                  bool opp_to_move, bool my_free_left) {
+    // β=0 = 纯手写，**早退**而不是走混合算术：混合写成
+    // blend*V + (1-blend)*he 时，只要 V 出现 Inf/NaN，0*Inf 就是 NaN，
+    // β=0 也会被污染（实测踩过：β=0 本该与基线逐位相同，却从 0.948 掉到 0.906）。
+    if (use_vnet && brain::value_net_available() && g_value_blend <= 0.0) {
+        return evaluate(after, w, b, acts_first) - w.w_waste * static_cast<double>(used);
+    }
     if (use_vnet && brain::value_net_available()) {
         float feats[brain::kValueObsDim];
         // v2 网络是信徒相对的（颜色无关）：局部帧直喂，无需 swap/取反。
@@ -60,7 +68,19 @@ double leaf_eval(const sim::State& after, const sim::Belief& b, const Weights& w
                               my_free_left, opp_free, feats);
         float v = 0.0f;
         brain::value_eval(feats, &v);
-        return static_cast<double>(v) * vscale - w.w_waste * static_cast<double>(used);
+        double val = static_cast<double>(v) * vscale;
+        // 非有限输出必须挡住：它会经 0*Inf 污染混合项，也会让叶排序失去意义。
+        if (!(val == val) || val > 1e30 || val < -1e30) {
+            return evaluate(after, w, b, acts_first) -
+                   w.w_waste * static_cast<double>(used);
+        }
+        // β<1 时与手写评估混合。手写项在同一回合内的差异是系统性的，
+        // 把网络的贡献压到它之下，可以只借用网络"跨状态排序"的好处。
+        if (g_value_blend < 1.0) {
+            const double he = evaluate(after, w, b, acts_first);
+            val = g_value_blend * val + (1.0 - g_value_blend) * he;
+        }
+        return val - w.w_waste * static_cast<double>(used);
     }
     return evaluate(after, w, b, acts_first) - w.w_waste * static_cast<double>(used);
 }
@@ -288,6 +308,10 @@ double opponent_best(const sim::State& s, const sim::Belief& b, const Weights& w
 
 void set_leaf_noise(double sigma) {
     g_leaf_noise = sigma > 0.0 ? sigma : 0.0;
+}
+
+void set_value_blend(double beta) {
+    g_value_blend = beta < 0.0 ? 0.0 : (beta > 1.0 ? 1.0 : beta);
 }
 
 Plan search_turn(const TurnInput& in, const Weights& w, const Deadline& deadline,

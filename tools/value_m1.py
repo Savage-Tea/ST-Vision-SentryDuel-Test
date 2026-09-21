@@ -41,7 +41,7 @@ import torch.nn as nn
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-from tools.value_net import IN_DIM, ValueNet  # noqa: E402
+from tools.value_net import IN_DIM, ValueNet, export_weights  # noqa: E402
 
 ENGINE = ROOT / "build" / "engine" / "runner"
 LIBDIR = ROOT / "build" / "engine"
@@ -111,6 +111,9 @@ def main() -> int:
     ap.add_argument("--data", help="已有样本 npz（跳过生成）")
     ap.add_argument("--out", default="build/m1_samples.npz")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--export", action="store_true",
+                    help="把训好的网络导出到 brain/value_weights.h"
+                         "（先把输出层重标定成**分差单位**）")
     args = ap.parse_args()
 
     data_path = ROOT / args.out
@@ -184,6 +187,16 @@ def main() -> int:
         a_net = rank_acc(v_net, y, m, 200000, rng2)
         a_h = rank_acc(vh, y, m, 200000, rng2)
         print(f"{name:<22}{a_net:>10.4f}{a_h:>11.4f}{int(m.sum()):>8}")
+    if args.export:
+        # 重标定：训练时标签标准化过（yn=(y-ymu)/ysd），把 ysd/ymu 折进输出层，
+        # 网络就直接输出"分差（点）"。这样 C++ 侧不需要额外常数，
+        # 而且与 evaluate() 处在同一量纲上（w_diff=1.0 ≈ 1 分），
+        # 叶评估里那个 w_waste 平局项才有意义。配 SD_VALUE_SCALE=1.0。
+        with torch.no_grad():
+            net.fc3.weight.mul_(float(ysd))
+            net.fc3.bias.mul_(float(ysd)).add_(float(ymu))
+        export_weights(net, ROOT / "brain" / "value_weights.h")
+
     print("\n（0.5 = 抛硬币。V 若不能明显超过手写 eval，就不该接线。）")
     return 0
 
