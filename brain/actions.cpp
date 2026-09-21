@@ -29,10 +29,32 @@ void collect_candidates(const sim::State& s, char side, bool free_turn,
         push(sim::kTurn, f);
     }
 
+    // 开火候选的门槛。
+    //
+    // 【原版】can_see_enemy || 信念里**每一格**都在火力通道内。
+    // 后者近似恒假：SideBelief::begin_turn 每回合都把信念按 3 格 dilate
+    // （belief_state.cpp 的"① 扩张"），之后 certain=false、信念是一大团，
+    // 而 all_in_fire_lane 要求全中才返回 true。于是门槛实际退化成
+    // "肉眼看得见"——scan(CD 3) 之所以能开火，只是因为 scan 当回合会把
+    // 信念塌缩成单点。净效果：**每 3 回合才有一次开火机会**；其余回合若
+    // 敌人不在 2 格视野内，AI 连"开火"这个选项都不存在，只能 move/turn，
+    // 而评估函数里唯一给分的就是往得分区走 —— 这正是回放里那条 3 回合
+    // 死亡循环（扫描 → 走进枪口 → 死 → 复活）的成因。
+    //
+    // 【改】改为看搜索当前的敌方**代表位置**（= 最后已知位置，由
+    // apply_belief → write_anchor_into 写回）。那才是搜索里真正在推演的
+    // 那个点，也是开火时瞄准的目标。打空的概率该由叶评估的 threat_prob
+    // 折扣承担，不该由候选生成器用"全知"标准一票否决。
+    //
+    // 保留 all_in_fire_lane 作为额外分支：新条件是它的超集，只增不减候选，
+    // 不会让任何原本可用的选项消失。
     if (me.fire_cd == 0) {
-        if (can_see_enemy) {
-            push(sim::kFire, 0);
-        } else if (belief != nullptr && sim::all_in_fire_lane(*belief, me, s.obstacles)) {
+        const Sentry& opp = s.sentry_for(side == 'R' ? 'B' : 'R');
+        const bool anchor_hittable =
+            sim::fire_hit(me, opp.last_known_pos, s.obstacles).x >= 0;
+        const bool all_belief_hittable =
+            belief != nullptr && sim::all_in_fire_lane(*belief, me, s.obstacles);
+        if (can_see_enemy || anchor_hittable || all_belief_hittable) {
             push(sim::kFire, 0);
         }
     }
