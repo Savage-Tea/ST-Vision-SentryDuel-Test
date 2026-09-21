@@ -132,6 +132,18 @@ const bool g_do_opp_model = env_flag("ST_OPP_MODEL");
 #endif
 const bool g_zone_evidence = env_flag("ST_ZONE_EVIDENCE") || SD_ZONE_EVIDENCE;
 
+// 叶评估噪声（风格池用）。0 = 关闭，**线上部署就是这一档**，行为确定性不变。
+// 造随机化对手时必须烘进二进制（SD_LEAF_NOISE）：ST_* 环境变量在引擎进程里
+// 红蓝共享，用它会把对手也一起改掉。见 brain/search.h 的说明。
+#ifndef SD_LEAF_NOISE
+#define SD_LEAF_NOISE 0.0
+#endif
+const double g_leaf_noise = [] {
+    const char* v = std::getenv("ST_LEAF_NOISE");
+    const double s = v != nullptr ? std::atof(v) : static_cast<double>(SD_LEAF_NOISE);
+    return s > 0.0 ? s : 0.0;
+}();
+
 double env_double(const char* name, double fallback); // 定义见下方
 
 brain::MctsConfig load_mcts_config() {
@@ -340,6 +352,7 @@ char side_from_idx(int idx) { return idx == 0 ? 'R' : 'B'; }
 
 void run(const Board& board, char my_color) {
     const Clock::time_point deadline = Clock::now() + std::chrono::milliseconds(g_budget_ms);
+    brain::set_leaf_noise(g_leaf_noise);
 
     // 新对局：重置跨回合记忆（同进程只跑一局，这里是防御性写法）
     if (board.turn == 0 || board.turn < g_mem.last_turn) {

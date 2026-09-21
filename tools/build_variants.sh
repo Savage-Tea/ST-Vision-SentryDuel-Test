@@ -42,6 +42,16 @@ build var_sniper   -DSD_W_DANGER=8.0  -DSD_W_THREAT=1.2 -DSD_W_READY=1.0  # 重�
 build var_camper   -DSD_W_ZONE=1.6    -DSD_W_DIST=0.1    # 死守得分区
 build var_danger8  -DSD_W_DANGER=8.0                     # 只调死亡定价（之前的候选值）
 
+# ── 随机化对手 ──
+# 池子的真正缺陷不是"对手少"，是**对手确定**：原先 10/13 个对手只有 1~2 种
+# 对局，于是"2000 局胜率"是运气而非统计量。叶值加噪声后同一份策略在不同进程
+# 里走出不同的棋，胜率重新变回统计量 —— 而"对多样化对手的稳定性"恰恰是
+# 平台在考、我们最可能缺的那个性质（vs hunter 我们 0.945、RL-Scryer 1.000，
+# 是池里唯一一个既非家族、又符合平台排序的信号）。
+build var_noise_lo   -DSD_LEAF_NOISE=0.5   # 轻微扰动，仍在最优附近
+build var_noise_mid  -DSD_LEAF_NOISE=2.0   # 中等：会在接近的着法间摇摆
+build var_noise_hi   -DSD_LEAF_NOISE=6.0   # 强扰动：接近随机策略
+
 # 当前部署版本也放进池子（作为"我们自己"这个风格）
 cp -f build/my_ai.so pool/var_current.so
 echo "  pool/var_current.so  ← build/my_ai.so 的副本"

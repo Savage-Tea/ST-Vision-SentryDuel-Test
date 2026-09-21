@@ -3,11 +3,34 @@
 #include "brain/value_net.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 #include <vector>
 
 namespace brain {
 namespace {
+
+// ── 叶值噪声（风格池用）─────────────────────────────────────────────
+// 用 xorshift 而不是 <random>：叶子评估一次搜索要跑上万次，这里的开销
+// 直接进 act() 的时间预算。种子取进程启动时刻，让每个进程走出不同的棋。
+double g_leaf_noise = 0.0;
+std::uint32_t g_rng = 0;
+bool g_rng_seeded = false;
+
+inline double leaf_noise() {
+    if (g_leaf_noise <= 0.0) return 0.0;
+    if (!g_rng_seeded) {
+        g_rng = static_cast<std::uint32_t>(
+            std::chrono::steady_clock::now().time_since_epoch().count());
+        if (g_rng == 0) g_rng = 0x9e3779b9u;
+        g_rng_seeded = true;
+    }
+    g_rng ^= g_rng << 13;
+    g_rng ^= g_rng >> 17;
+    g_rng ^= g_rng << 5;
+    const double u = static_cast<double>(g_rng) / 4294967295.0; // [0,1]
+    return (u * 2.0 - 1.0) * g_leaf_noise;                      // [-σ, σ]
+}
 
 struct Leaf {
     double value = 0.0;
@@ -56,7 +79,8 @@ void dfs_our(const sim::State& s, const sim::Belief& b, int used, bool free_turn
         leaf.plan.count = depth;
         // 行动是有限资源：同等局面下优先选消耗更少的方案（仅用于打破平局）
         leaf.value = leaf_eval(after, b, w, acts_first, use_vnet, vscale, used,
-                               /*opp_to_move=*/true, free_turn);
+                               /*opp_to_move=*/true, free_turn) +
+                     leaf_noise();   // σ=0 时为 0，行为与原来完全一致
         leaf.state = after;
         leaf.belief = b;
         leaf.plan.valid = true;
@@ -261,6 +285,10 @@ double opponent_best(const sim::State& s, const sim::Belief& b, const Weights& w
 }
 
 } // namespace
+
+void set_leaf_noise(double sigma) {
+    g_leaf_noise = sigma > 0.0 ? sigma : 0.0;
+}
 
 Plan search_turn(const TurnInput& in, const Weights& w, const Deadline& deadline,
                  SearchStats* stats) {
