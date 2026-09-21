@@ -69,4 +69,16 @@ bool any_in_fire_lane(const Belief& b, const Sentry& me,
 bool all_in_fire_lane(const Belief& b, const Sentry& me,
                       const std::vector<Pos>& obstacles);
 
+// 用「对手上一阶段占了点」这条证据收窄信念：把不在得分区里的格子剔掉。
+//
+// 依据：对手分数 +1 且这不是击杀的 +2，说明他行动阶段**结束时在得分区里**。
+// 这是一条免费且极强的约束（得分区只有 5 格），而我们此前完全没用过对手的
+// 分数。调用方必须先做扩张——扩张覆盖的正是他那个阶段的移动，先扩张再求交
+// 才是正确顺序。
+//
+// 返回值＝是否真的收窄了。**矛盾时保留原信念**：这条推断依赖分数 delta 的
+// 算术（要减掉击杀 +2、超时 +1），算错一次就会把真位置剔出去，而
+// 「support 必覆盖真位置」是信念的基本契约，不能破。
+bool intersect_zone(Belief& b, const std::vector<Pos>& zones);
+
 } // namespace sim

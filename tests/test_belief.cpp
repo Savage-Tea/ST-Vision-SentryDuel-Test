@@ -1,11 +1,12 @@
 // tests/test_belief.cpp —— 敌方可达集信念的单元测试
 //
-// 信念是纯逻辑，可以直接断言，不需要跑对局。这里覆盖的四条规则
+// 信念是纯逻辑，可以直接断言，不需要跑对局。这里覆盖的五条规则
 // 各对应一类会静默出错的写法：
 //   ① 扩张必须绕障碍、且不含我方所在格
 //   ② 视野证伪必须只剔除"当前看得见"的格子
 //   ③ 塌缩（看见/扫描/击杀重生）必须精确到一格
 //   ④ 火力覆盖判定必须与引擎的通道遮挡规则一致（复用 sim::fire_hit）
+//   ⑤ 得分区证据（对手占点）收窄信念，且与信念矛盾时必须回退
 
 #include "sim/belief.h"
 #include "sim/rules.h"
@@ -27,7 +28,7 @@ sim::State base_state() { return sim::make_initial_state(); }
 
 // 用带障碍的官方地图：{1,1} 与 {5,5}
 void test_dilate() {
-    std::printf("[1/4] 扩张（BFS ≤3，绕障碍，不含我方格）\n");
+    std::printf("[1/5] 扩张（BFS ≤3，绕障碍，不含我方格）\n");
     sim::State s = base_state();
     const Pos my_pos{0, 0};
 
@@ -57,7 +58,7 @@ void test_dilate() {
 }
 
 void test_prune_by_vision() {
-    std::printf("[2/4] 视野证伪（只剔除当前看得见的格子）\n");
+    std::printf("[2/5] 视野证伪（只剔除当前看得见的格子）\n");
     sim::State s = base_state();
 
     Sentry me{};
@@ -92,7 +93,7 @@ void test_prune_by_vision() {
 }
 
 void test_fire_lane() {
-    std::printf("[3/4] 火力覆盖判定（与引擎通道遮挡一致）\n");
+    std::printf("[3/5] 火力覆盖判定（与引擎通道遮挡一致）\n");
     sim::State s = base_state();
 
     Sentry me{};
@@ -127,7 +128,7 @@ void test_fire_lane() {
 }
 
 void test_nearest_and_helpers() {
-    std::printf("[4/4] 辅助：count / nearest_to / reset_to\n");
+    std::printf("[4/5] 辅助：count / nearest_to / reset_to\n");
     sim::Belief b;
     require(b.empty(), "默认构造应为空");
     require(b.count() == 0, "默认构造 count 应为 0");
@@ -151,6 +152,41 @@ void test_nearest_and_helpers() {
     require(b.count() == 1 && b.has(3, 3), "reset_to 应清空后只留一格");
 }
 
+// 得分区证据：对手分数 +1 ⇒ 他行动阶段结束时在得分区里。
+// 关键不是"能收窄"，而是**矛盾时必须回退**——这条推断依赖分数 delta 的
+// 算术（要减掉击杀 +2），算错一次就会把真位置剔出信念，破坏
+// 「support 必覆盖真位置」的契约。
+void test_intersect_zone() {
+    std::printf("[5/5] 得分区证据：收窄信念，矛盾时回退\n");
+    sim::State s = base_state();
+    const std::vector<Pos>& zones = s.score_zones;
+    require(zones.size() == 5, "得分区应为中心十字 5 格");
+
+    sim::Belief b;
+    for (int y = 0; y < sim::kBoardSize; ++y)
+        for (int x = 0; x < sim::kBoardSize; ++x) b.set(x, y);
+    const int before = b.count();
+    require(sim::intersect_zone(b, zones), "横跨全图的信念应能被收窄");
+    require(b.count() == static_cast<int>(zones.size()),
+            "收窄后应恰好等于得分区格数");
+    require(b.count() < before, "收窄应真的减少格子");
+    for (const Pos& z : zones) require(b.has(z), "得分区内的格子应保留");
+
+    // 与得分区不相交 → 推断与信念矛盾 → 必须原样保留
+    sim::Belief c;
+    c.set(0, 0);
+    c.set(0, 1);
+    require(!sim::intersect_zone(c, zones), "矛盾时应返回 false");
+    require(c.count() == 2 && c.has(0, 0) && c.has(0, 1),
+            "矛盾时必须保留原信念（不能丢真位置）");
+
+    // 已经只在区内 → 成功但数量不变
+    sim::Belief d;
+    for (const Pos& z : zones) d.set(z);
+    require(sim::intersect_zone(d, zones), "已在区内应返回 true");
+    require(d.count() == static_cast<int>(zones.size()), "数量应不变");
+}
+
 } // namespace
 
 int main() {
@@ -159,6 +195,7 @@ int main() {
     test_prune_by_vision();
     test_fire_lane();
     test_nearest_and_helpers();
+    test_intersect_zone();
 
     std::printf("\n--- 结果 ---\n");
     if (g_failures == 0) {

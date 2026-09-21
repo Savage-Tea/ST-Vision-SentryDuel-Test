@@ -98,4 +98,28 @@ bool all_in_fire_lane(const Belief& b, const Sentry& me,
     return any;
 }
 
+bool intersect_zone(Belief& b, const std::vector<Pos>& zones) {
+    Belief cand = b;
+    int kept = 0;
+    for (int y = 0; y < kBoardSize; ++y) {
+        for (int x = 0; x < kBoardSize; ++x) {
+            if (!cand.has(x, y)) continue;
+            bool in_zone = false;
+            for (const Pos& z : zones) {
+                if (z.x == x && z.y == y) { in_zone = true; break; }
+            }
+            if (in_zone) {
+                ++kept;
+            } else {
+                cand.cells[cell_index(x, y)] = 0;
+            }
+        }
+    }
+    // 交集为空 = 这条推断与信念矛盾（多半是分数 delta 算错了）。
+    // 保留原信念：宁可少一条证据，也不能把真位置剔出去。
+    if (kept == 0) return false;
+    b = cand;
+    return true;
+}
+
 } // namespace sim

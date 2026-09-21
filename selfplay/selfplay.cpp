@@ -119,7 +119,13 @@ void play_game(unsigned seed, std::vector<Sample>& out) {
             SideState& sd = sides[si];
 
             LocalView v = make_view(world, sd.color, sd.belief);
-            sd.belief.begin_turn(v.state, world.turn, v.enemy_visible);
+            // 第 4 个参数 = 对手上一阶段是否占了点（部署侧由「对手分数 +1 且
+            // 非击杀」推断）。这里显式传 false：本文件是阶段③ PPO 的轨迹生成器，
+            // 那条路线 95 轮零胜已归档，没有跟着接。**这是一个已知且写在明处的
+            // 缺口**，不是静默漂移——若日后重启训练路径，必须把 SideState 加上
+            // 对手分数基线，否则训练观测与部署观测会不一致。
+            sd.belief.begin_turn(v.state, world.turn, v.enemy_visible,
+                                 /*opp_occupied_zone=*/false);
             v = make_view(world, sd.color, sd.belief);
 
             // 免费转向资格：开局，或刚从别处被击回出生点

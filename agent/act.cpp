@@ -100,6 +100,38 @@ const bool g_use_ab = env_flag("ST_SEARCH_AB");
 // baseline 0.770→0.780、hunter 0.715→0.775。ST_OPP_MODEL=1 可重新启用。
 const bool g_do_opp_model = env_flag("ST_OPP_MODEL");
 
+// 「对手占点」这条信念证据。**默认关**：实测它让 AI 放弃得分区
+// （在区回合占比 40~55% → 15~20%，池平均 0.91 → 0.70）。
+//
+// 根因（已逐项测出，不是猜测）：**评估函数的威胁/危险项与信念的精细度
+// 耦合**。threat_prob 与 danger_unknown 都是"信念集合上的比例"，信念被
+// 这条证据压到 5 格后，两个比例同时跳变：
+//
+//   证据开                   池平均 0.6954   （死亡 4.0→5.0~6.0 次/局）
+//   证据开 + 关威胁项        池平均 0.9117   ← 回到基线
+//   证据开 + w_danger=8      池平均 0.4858
+//   证据开 + w_zone 0.8→6.0  池平均 0.6971   （毫无作用）
+//
+// 主导项是 **threat_prob 被放大**：它一涨，"我能打到他"的奖励
+// （w_threat 0.4 + w_ready 0.45）把 AI 推成莽夫，冲进火力范围挨打；
+// 死亡翻倍 → 一半以上的回合在从出生点走回来 → 占区率 40~55% 掉到 15~20%。
+// 提高 w_zone 无效正好印证了这一点：AI 不是"权衡后不进区"，是**进不去**。
+//
+// 换句话说：**当前这套权重是校准在"信念很模糊"这个前提下的**——信念一旦
+// 变准，整个权重向量同时失效。所以这条证据不能单独上线，必须先做 A-0
+// （把不确定性从"集合上的比例"换成稳定的概率语义）并重新校准。
+//
+// 所以这条证据不能单独上线：必须先把不确定性的语义从"集合上的比例"
+// 换成稳定的概率（见 brain/eval.h 的 threat_stats 说明），否则它只会
+// 把评估函数的定价错误暴露出来。
+// ST_ZONE_EVIDENCE=1 可打开做 A/B；SD_ZONE_EVIDENCE=1 可烘进二进制
+// （做候选变体时必须烘——ST_ 环境变量在引擎进程里红蓝共享，用环境变量
+//  做对照会把对手的权重也一起改掉）。
+#ifndef SD_ZONE_EVIDENCE
+#define SD_ZONE_EVIDENCE 0
+#endif
+const bool g_zone_evidence = env_flag("ST_ZONE_EVIDENCE") || SD_ZONE_EVIDENCE;
+
 double env_double(const char* name, double fallback); // 定义见下方
 
 brain::MctsConfig load_mcts_config() {
@@ -145,6 +177,11 @@ struct Memory {
 
     // 被击中推断出的对手无力窗口（绝对回合号）。见 brain/search.h 的说明。
     int opp_defenseless_until = -1;
+
+    // 上一次我方回合开始时看到的对手分数。用于推断"对手上一阶段是否占了点"：
+    // 对手一回合内只可能靠两件事涨分——击杀我们 +2、占点 +1。
+    // 负值 = 本局还没有基线（回合 0 会重置 Memory）。
+    int last_opp_score = -1;
 
     // 阶段③ 策略网络的隐状态。必须**跨 act() 调用存活**——它就是网络对
     // 部分可观测历史的记忆。新对局时必须清零（见 run() 开头的重置）。
@@ -330,8 +367,18 @@ void run(const Board& board, char my_color) {
         g_mem.opp_defenseless_until = board.turn + 1;
     }
 
+    // 分数证据：对手分数涨了 +1（而那不是击杀的 +2）⇒ 他上一阶段**结束时在
+    // 得分区里**。得分区只有 5 格，这是一条免费且极强的位置约束，此前我们
+    // 完全没用过对手的分数。击杀的那 2 分用 just_respawned 扣掉——我们被打死
+    // 的那一回合，正好是本回合。
+    const int opp_delta =
+        (g_mem.last_opp_score < 0) ? 0 : st.blue.score - g_mem.last_opp_score;
+    const bool opp_occupied_zone =
+        g_zone_evidence && (opp_delta - (just_respawned ? 2 : 0)) >= 1;
+    g_mem.last_opp_score = st.blue.score;
+
     // —— 敌方位置信念的维护（与自对弈侧共用 brain/SideBelief）——
-    g_mem.belief.begin_turn(st, board.turn, enemy_visible);
+    g_mem.belief.begin_turn(st, board.turn, enemy_visible, opp_occupied_zone);
     // 策略路径不覆盖敌方位置：obs v3 要的是引擎原样的 Intel，
     // 用我们的可达集推断覆盖它就是喂给网络一个训练时见不到的输入。
     if (!g_use_policy) apply_belief(st, board.turn);

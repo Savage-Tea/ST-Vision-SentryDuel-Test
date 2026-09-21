@@ -33,8 +33,13 @@ struct SideBelief {
     // 塌缩到确定的一格
     void collapse(const Pos& p, char facing);
 
-    // 回合开始
-    void begin_turn(const sim::State& local, int turn, bool enemy_visible);
+    // 回合开始。
+    //
+    // opp_occupied_zone：对手上一行动阶段**结束时是否在得分区里**。
+    // 由「对手分数 +1 且那不是击杀的 +2」推断（见 sim::intersect_zone）。
+    // 这条证据免费且极强（得分区只有 5 格），此前我们完全没用过对手的分数。
+    void begin_turn(const sim::State& local, int turn, bool enemy_visible,
+                    bool opp_occupied_zone);
 
     // 我方一次成功行动之后
     void after_action(const sim::State& local);
