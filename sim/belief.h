@@ -25,17 +25,32 @@ inline constexpr int kCells = kBoardSize * kBoardSize;
 
 inline int cell_index(int x, int y) { return y * kBoardSize + x; }
 
+// 敌方位置的**概率分布**（对朝向取边际）。
+//
+// 为什么不是"可能位置集合"：集合上算出来的比例（"多少比例的格子在我火力
+// 范围内"）大小取决于集合有多宽，而集合有多宽是"我们知道多少"的副产物。
+// 实测代价见 agent/act.cpp 的 g_zone_evidence 注释：信念一旦被证据压窄，
+// threat_prob 这类比例会跳变，整套权重同时失效。
+//
+// 不变式：
+//   · mass[i] >= 0，Σmass ∈ {0, 1}（1 = 有效分布，0 = 空/未初始化）
+//   · has(x,y) 等价于 mass > 0 —— **不另存一份支持集**，避免两个字段失同步
 struct Belief {
-    std::array<unsigned char, kCells> cells{};
+    std::array<float, kCells> mass{};
 
     static bool in_bounds(const Pos& p) {
         return p.x >= 0 && p.x < kBoardSize && p.y >= 0 && p.y < kBoardSize;
     }
 
-    void clear() { cells.fill(0); }
-    bool has(int x, int y) const { return cells[cell_index(x, y)] != 0; }
+    void clear() { mass.fill(0.0f); }
+    bool has(int x, int y) const { return mass[cell_index(x, y)] > 0.0f; }
     bool has(const Pos& p) const { return in_bounds(p) && has(p.x, p.y); }
-    void set(int x, int y) { cells[cell_index(x, y)] = 1; }
+    float at(int x, int y) const { return mass[cell_index(x, y)]; }
+    float at(const Pos& p) const { return in_bounds(p) ? at(p.x, p.y) : 0.0f; }
+    void clear_at(int x, int y) { mass[cell_index(x, y)] = 0.0f; }
+
+    // 构造用：置 1（未归一）。要用做概率必须先 normalize()。
+    void set(int x, int y) { mass[cell_index(x, y)] = 1.0f; }
     void set(const Pos& p) {
         if (in_bounds(p)) set(p.x, p.y);
     }
@@ -43,6 +58,12 @@ struct Belief {
         clear();
         set(p);
     }
+
+    float total_mass() const;
+    // 归一化。总质量为 0（推断与信念矛盾、或支持被清空）时返回 false 且
+    // **不动内容** —— 调用方必须回退到备份，"support 必覆盖真位置"不能破。
+    bool normalize();
+
     int count() const;
     bool empty() const { return count() == 0; }
 

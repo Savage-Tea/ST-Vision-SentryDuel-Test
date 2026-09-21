@@ -1,17 +1,19 @@
 // tests/test_belief.cpp —— 敌方可达集信念的单元测试
 //
-// 信念是纯逻辑，可以直接断言，不需要跑对局。这里覆盖的五条规则
+// 信念是纯逻辑，可以直接断言，不需要跑对局。这里覆盖的六条规则
 // 各对应一类会静默出错的写法：
 //   ① 扩张必须绕障碍、且不含我方所在格
 //   ② 视野证伪必须只剔除"当前看得见"的格子
 //   ③ 塌缩（看见/扫描/击杀重生）必须精确到一格
 //   ④ 火力覆盖判定必须与引擎的通道遮挡规则一致（复用 sim::fire_hit）
 //   ⑤ 得分区证据（对手占点）收窄信念，且与信念矛盾时必须回退
+//   ⑥ 概率语义不变式（扩张守恒 / 证据步归一 / 矛盾回退）
 
 #include "sim/belief.h"
 #include "sim/rules.h"
 
 #include <cstdio>
+#include <cmath>
 #include <cstdlib>
 
 namespace {
@@ -28,7 +30,7 @@ sim::State base_state() { return sim::make_initial_state(); }
 
 // 用带障碍的官方地图：{1,1} 与 {5,5}
 void test_dilate() {
-    std::printf("[1/5] 扩张（BFS ≤3，绕障碍，不含我方格）\n");
+    std::printf("[1/6] 扩张（BFS ≤3，绕障碍，不含我方格）\n");
     sim::State s = base_state();
     const Pos my_pos{0, 0};
 
@@ -58,7 +60,7 @@ void test_dilate() {
 }
 
 void test_prune_by_vision() {
-    std::printf("[2/5] 视野证伪（只剔除当前看得见的格子）\n");
+    std::printf("[2/6] 视野证伪（只剔除当前看得见的格子）\n");
     sim::State s = base_state();
 
     Sentry me{};
@@ -93,7 +95,7 @@ void test_prune_by_vision() {
 }
 
 void test_fire_lane() {
-    std::printf("[3/5] 火力覆盖判定（与引擎通道遮挡一致）\n");
+    std::printf("[3/6] 火力覆盖判定（与引擎通道遮挡一致）\n");
     sim::State s = base_state();
 
     Sentry me{};
@@ -128,7 +130,7 @@ void test_fire_lane() {
 }
 
 void test_nearest_and_helpers() {
-    std::printf("[4/5] 辅助：count / nearest_to / reset_to\n");
+    std::printf("[4/6] 辅助：count / nearest_to / reset_to\n");
     sim::Belief b;
     require(b.empty(), "默认构造应为空");
     require(b.count() == 0, "默认构造 count 应为 0");
@@ -157,7 +159,7 @@ void test_nearest_and_helpers() {
 // 算术（要减掉击杀 +2），算错一次就会把真位置剔出信念，破坏
 // 「support 必覆盖真位置」的契约。
 void test_intersect_zone() {
-    std::printf("[5/5] 得分区证据：收窄信念，矛盾时回退\n");
+    std::printf("[5/6] 得分区证据：收窄信念，矛盾时回退\n");
     sim::State s = base_state();
     const std::vector<Pos>& zones = s.score_zones;
     require(zones.size() == 5, "得分区应为中心十字 5 格");
@@ -187,6 +189,38 @@ void test_intersect_zone() {
     require(d.count() == static_cast<int>(zones.size()), "数量应不变");
 }
 
+// 概率语义的不变式。这三条破了**不会报错**，只会静默地让
+// threat_prob / danger_unknown 偏低或偏高，进而让整套权重失去意义——
+// 正是 A-0 要修的那个病。
+void test_mass() {
+    std::printf("[6/6] 概率语义：扩张守恒、证据步归一、矛盾回退\n");
+    sim::State s = base_state();
+    const Pos my_pos{0, 0};
+
+    sim::Belief b;
+    b.reset_to({6, 6});
+    require(std::fabs(b.total_mass() - 1.0f) < 1e-5f, "reset_to 后总质量应为 1");
+
+    sim::dilate(b, 3, my_pos, s.obstacles);
+    require(std::fabs(b.total_mass() - 1.0f) < 1e-4f, "扩张必须守恒质量");
+    require(b.has(6, 6), "扩张后起点仍应有质量");
+    require(b.at(6, 6) < 0.5f, "扩张后不应有任何格子独占大部分质量");
+
+    // 视野证伪：剔完必须重新归一，否则总质量悄悄小于 1
+    Sentry me{};
+    me.last_known_pos = {0, 0};
+    me.last_known_facing = 'E';
+    sim::prune_by_vision(b, me, s.obstacles);
+    require(std::fabs(b.total_mass() - 1.0f) < 1e-4f, "视野证伪后必须重新归一");
+
+    // 矛盾证据：全部质量都被剔掉时必须原样回退，不能变成空信念
+    sim::Belief c;
+    c.reset_to({0, 0}); // 与得分区不相交
+    require(!sim::intersect_zone(c, s.score_zones), "矛盾时应返回 false");
+    require(c.has(0, 0) && std::fabs(c.total_mass() - 1.0f) < 1e-6f,
+            "矛盾时必须原样保留（support 不能丢真位置）");
+}
+
 } // namespace
 
 int main() {
@@ -196,6 +230,7 @@ int main() {
     test_fire_lane();
     test_nearest_and_helpers();
     test_intersect_zone();
+    test_mass();
 
     std::printf("\n--- 结果 ---\n");
     if (g_failures == 0) {

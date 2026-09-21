@@ -377,6 +377,18 @@ void run(const Board& board, char my_color) {
         g_zone_evidence && (opp_delta - (just_respawned ? 2 : 0)) >= 1;
     g_mem.last_opp_score = st.blue.score;
 
+    // 诊断：直接看见对手的那一刻，上一回合推理留下的信念里还有没有他。
+    // 信念每回合按 ≤3 格扩张，所以正常情况下真位置**必然**还在集合里；
+    // 一旦这条开始报数，说明某条证据把真位置剔出去了（support 契约被破坏）。
+    // 放在 begin_turn 之前，看到的才是"推理结果"，而不是刚塌缩的观测。
+    if (g_debug && enemy_visible && st.blue.last_known_pos.x >= 0 &&
+        !g_mem.belief.set.has(st.blue.last_known_pos)) {
+        static int misses = 0;
+        ++misses;
+        std::fprintf(stderr, "[belief-miss] turn=%d side=%c misses=%d support=%d\n",
+                     board.turn, my_color, misses, g_mem.belief.set.count());
+    }
+
     // —— 敌方位置信念的维护（与自对弈侧共用 brain/SideBelief）——
     g_mem.belief.begin_turn(st, board.turn, enemy_visible, opp_occupied_zone);
     // 策略路径不覆盖敌方位置：obs v3 要的是引擎原样的 Intel，

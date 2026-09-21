@@ -32,18 +32,25 @@ bool lane_clear_any_facing(const Sentry& shooter, const Pos& target,
 
 ThreatStats threat_stats(const sim::State& s, const sim::Belief& belief) {
     ThreatStats stats;
-    const int n = belief.count();
-    if (n <= 0) return stats;
+    if (!(belief.total_mass() > 0.0f)) return stats;
     const Sentry& me = s.red;
     // 锚点 = 最后已知位置，即对局状态里给搜索用的那个"代表位置"
     const Pos anchor = s.blue.last_known_pos;
 
-    int threat = 0;
-    int unknown_total = 0;
-    int unknown_danger = 0;
+    // 两个统计量都改成**概率质量之和**，不再是"格子数占比"。
+    //
+    // 为什么必须换：占比的分母是信念集合的大小，而集合大小是"我们知道多少"
+    // 的副产物。同一条证据（例如"对手占了点"）把信念压窄之后，占比会跳变，
+    // 于是为该占比校准的权重同时失效——实测证据开→关威胁项，池平均
+    // 0.6954→0.9117，主导项就是被放大的 threat_prob（见 agent/act.cpp）。
+    // 概率质量不随"集合多宽"漂移，权重才有稳定含义。
+    float danger_elsewhere = 0.0f;  // 除锚点外、能打到我的那些位置的推断概率
+    float threat_mass = 0.0f;       // 落在我方火力范围内的推断概率
+
     for (int y = 0; y < sim::kBoardSize; ++y) {
         for (int x = 0; x < sim::kBoardSize; ++x) {
-            if (!belief.has(x, y)) continue;
+            const float m = belief.at(x, y);
+            if (m <= 0.0f) continue;
             const Pos c{x, y};
             // 对手在那里的话能否打到我？朝向未知 → 按最坏情况（任意朝向）
             Sentry enemy{};
@@ -51,30 +58,15 @@ ThreatStats threat_stats(const sim::State& s, const sim::Belief& belief) {
             const bool can_hit = lane_clear_any_facing(enemy, me.last_known_pos, s.obstacles);
             if (c.x == anchor.x && c.y == anchor.y) {
                 stats.danger_known = can_hit ? 1.0 : 0.0;
-            } else {
-                ++unknown_total;
-                if (can_hit) ++unknown_danger;
+            } else if (can_hit) {
+                danger_elsewhere += m;
             }
             // 我在那里的话能否打到他？（用我方真实朝向）
-            if (lane_clear(me, c, s.obstacles)) ++threat;
+            if (lane_clear(me, c, s.obstacles)) threat_mass += m;
         }
     }
-    // 锚点不在信念里时（例如击杀后锚点被重置），退化为按整集统计
-    if (unknown_total == 0) {
-        for (int y = 0; y < sim::kBoardSize; ++y)
-            for (int x = 0; x < sim::kBoardSize; ++x) {
-                if (!belief.has(x, y)) continue;
-                ++unknown_total;
-                Sentry enemy{};
-                enemy.last_known_pos = {x, y};
-                if (lane_clear_any_facing(enemy, me.last_known_pos, s.obstacles)) {
-                    ++unknown_danger;
-                }
-            }
-    }
-    stats.danger_unknown =
-        unknown_total > 0 ? static_cast<double>(unknown_danger) / unknown_total : 0.0;
-    stats.threat_prob = static_cast<double>(threat) / static_cast<double>(n);
+    stats.danger_unknown = static_cast<double>(danger_elsewhere);
+    stats.threat_prob = static_cast<double>(threat_mass);
     return stats;
 }
 
