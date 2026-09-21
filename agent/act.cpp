@@ -381,16 +381,23 @@ void run(const Board& board, char my_color) {
     // 信念每回合按 ≤3 格扩张，所以正常情况下真位置**必然**还在集合里；
     // 一旦这条开始报数，说明某条证据把真位置剔出去了（support 契约被破坏）。
     // 放在 begin_turn 之前，看到的才是"推理结果"，而不是刚塌缩的观测。
-    if (g_debug && enemy_visible && st.blue.last_known_pos.x >= 0 &&
-        !g_mem.belief.set.has(st.blue.last_known_pos)) {
-        static int misses = 0;
-        ++misses;
-        std::fprintf(stderr, "[belief-miss] turn=%d side=%c misses=%d support=%d\n",
-                     board.turn, my_color, misses, g_mem.belief.set.count());
-    }
+    // 支持契约的诊断：检查点在 begin_turn **内部**（扩张之后、塌缩之前），
+    // 这里只负责把新增的次数报出来。计数不增加就什么都不打印。
+    const int misses_before = g_mem.belief.debug_miss;
 
     // —— 敌方位置信念的维护（与自对弈侧共用 brain/SideBelief）——
     g_mem.belief.begin_turn(st, board.turn, enemy_visible, opp_occupied_zone);
+
+    if (g_debug && g_mem.belief.debug_miss != misses_before) {
+        std::fprintf(stderr,
+                     "[belief-miss] turn=%d side=%c total=%d me=(%d,%d)%c "
+                     "anchor=(%d,%d) opp=(%d,%d)\n",
+                     board.turn, my_color, g_mem.belief.debug_miss,
+                     st.red.last_known_pos.x, st.red.last_known_pos.y,
+                     st.red.last_known_facing,
+                     g_mem.belief.anchor.x, g_mem.belief.anchor.y,
+                     st.blue.last_known_pos.x, st.blue.last_known_pos.y);
+    }
     // 策略路径不覆盖敌方位置：obs v3 要的是引擎原样的 Intel，
     // 用我们的可达集推断覆盖它就是喂给网络一个训练时见不到的输入。
     if (!g_use_policy) apply_belief(st, board.turn);

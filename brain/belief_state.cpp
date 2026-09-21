@@ -43,6 +43,11 @@ void SideBelief::begin_turn(const sim::State& local, int turn, bool enemy_visibl
         sim::dilate(set, kEnemyStepsPerTurn, local.red.last_known_pos, local.obstacles);
         certain = false; // 位置不再确定 —— 正是该开雷达的时刻
     }
+    // 支持契约的检查点：扩张已经跑完（覆盖了敌人上一阶段的移动），此时若
+    // 引擎报给我们的真实位置仍不在信念里，就是真的漏人了。放在这一步之前
+    // 是错的——那时扩张还没跑，必然漏。
+    if (enemy_visible && reported.x >= 0 && !set.has(reported)) ++debug_miss;
+
     // ② 塌缩：看得见 → 精确位置；否则若还没有任何情报，用引擎给的兜底
     if (enemy_visible && reported.x >= 0) {
         collapse(reported, reported_facing);

@@ -28,6 +28,12 @@ struct SideBelief {
     bool known = false;               // 是否已获得过任何情报
     bool certain = false;             // 是"知情"还是"假设"（决定要不要开雷达）
 
+    // 诊断计数器（ST_DEBUG 用）：扩张之后、塌缩之前，信念里居然没有
+    // 引擎刚报给我们的真实位置。**这才是 support 契约的检查点** —— 放在
+    // begin_turn 之前是错的：那时扩张还没跑，敌人本阶段的移动尚未被覆盖，
+    // 必然"漏"（实测踩过：40 局 50 次假阳性，差点当成真 bug 去查）。
+    int debug_miss = 0;
+
     void clear();
 
     // 塌缩到确定的一格
