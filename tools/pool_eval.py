@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
+
 import json
 import subprocess
 import sys
@@ -26,21 +26,26 @@ ROOT = Path(__file__).resolve().parent.parent
 LEAGUE = ROOT / "tools" / "league.py"
 
 
-def pool_members(exclude: Path) -> list[Path]:
-    """风格池 = 官方对手 + 引擎确定性测试 AI + 历史快照 + 风格变体。
+# 按设计就是"当前候选的副本"的成员，**永远**不当对手。
+#
+# 为什么必须按名字排，而不是按逐字节相同排：逐字节判据依赖编译产物，
+# 而同一个策略用不同命令行重新编译会得到不同的字节。实测踩到：
+#   · 评测 build/my_ai.so         → var_current 字节相同，被排除
+#   · 评测 weight_fit 新编的候选  → var_current 字节不同，被留下当对手
+# 于是**同一个策略在两条路径上拿到不同的池子**，均值差 1/15×0.5≈0.033。
+# 而且把它当对手本身就是个退化目标：那是镜像局，和平台的真实对手场无关。
+SELF_COPY_NAMES = {"var_current.so"}
 
-    跳过与候选**逐字节相同**的成员：把自己当对手是重复计数。
-    （注意是按内容判，不是按路径——池里的 var_current.so 在评测别的候选时
-    是一个合法的对手。）
-    """
-    mine = hashlib.md5(exclude.read_bytes()).hexdigest()
+
+def pool_members(exclude: Path) -> list[Path]:
+    """风格池 = 官方对手 + 引擎确定性测试 AI + 历史快照 + 风格变体。"""
     members: list[Path] = []
     for d in (ROOT / "build" / "opponents", ROOT / "pool"):
         if d.is_dir():
             members += sorted(p for p in d.glob("*.so"))
     return [m for m in members
             if m.resolve() != exclude.resolve()
-            and hashlib.md5(m.read_bytes()).hexdigest() != mine]
+            and m.name not in SELF_COPY_NAMES]
 
 
 def main() -> int:
