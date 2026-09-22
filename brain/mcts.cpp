@@ -1,5 +1,7 @@
 #include "brain/mcts.h"
 
+#include "brain/value_net.h"
+
 #include "brain/net.h"
 #include "obs/encode.h"
 
@@ -47,6 +49,8 @@ public:
 
     MctsResult run(const TurnInput& in) {
         acts_first_world_ = in.acts_first_world;
+        use_value_net_ = in.use_value_net;
+        vscale_ = in.value_scale;
         root_bans_ = &in.bans;
         root_enemy_visible_ = in.enemy_visible;
 
@@ -94,8 +98,31 @@ private:
 
     // 叶值：从该节点走子方视角评估。不做随机 rollout —— 本游戏完全确定性，
     // 随机走子到终局几乎没有信息量。
+    //
+    // 【(b') 值网络 + MCTS】与阶段① 的**裸 argmax 不同**：MCTS 的 Q 是多次
+    // 访问的**平均**，叶值的噪声在回传里会被平掉。这正是同一个值网络在
+    // 阶段① 上有害（β 给 2% 就掉 9 个点，因为 argmax 在几百个叶子里挑噪声
+    // 最大者）、却可能在这里有用的原因 —— 换的不是网络，是**聚合方式**。
+    //
+    // 网络颜色无关（我方恒为 s.red）：to_move=='B' 时先交换红蓝，再按
+    // "我是 s.red、轮到我"构建特征，得到的就是该走子方视角的值。
     double leaf_value(const Node& n) const {
         if (n.terminal) return terminal_value(n.state, n.to_move);
+        if (use_value_net_ && brain::value_net_available()) {
+            sim::State s = n.state;
+            if (n.to_move == 'B') std::swap(s.red, s.blue);
+            float feats[brain::kValueObsDim];
+            brain::value_features(s, n.belief, /*me_to_move=*/true,
+                                  sim::is_at_spawn(s, 'R'), sim::is_at_spawn(s, 'B'),
+                                  feats);
+            float v = 0.0f;
+            if (brain::value_eval(feats, &v)) {
+                const double val = static_cast<double>(v) * vscale_;
+                // 非有限输出必须挡住：NaN 会经回传污染整棵子树
+                // （阶段① 上就因为 0*Inf=NaN 把 β=0 都污染过）。
+                if (val == val && val < 1e30 && val > -1e30) return val;
+            }
+        }
         return evaluate_for(n.state, w_, n.belief, n.to_move,
                             (n.to_move == 'R') == acts_first_world_);
     }
@@ -342,6 +369,8 @@ private:
     const Weights& w_;
     // 我方（局部 'R'）在世界坐标里是否先手；来自 TurnInput，见 eval.h
     bool acts_first_world_ = true;
+    bool use_value_net_ = false;
+    double vscale_ = 30.0;
     const MctsConfig& cfg_;
     const Deadline& dl_;
     std::mt19937 rng_;

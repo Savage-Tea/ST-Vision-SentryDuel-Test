@@ -71,7 +71,11 @@ const bool g_debug = env_flag("ST_DEBUG");
 // 而实测它的强度并没有兑现——本地对确定性对手 10:13，反而不如 phase① 的
 // 21:10。所以默认不再启用，只保留 ST_MCTS=1 作为离线实验开关。
 // 代价：网络目前只在 MCTS 路径上被读取，默认路径下不参与决策。
-const bool g_use_mcts = env_flag("ST_MCTS");
+// 同样留编译期覆盖点（ST_* 在引擎进程里红蓝共享，做对照必须烘进二进制）。
+#ifndef SD_MCTS
+#define SD_MCTS 0
+#endif
+const bool g_use_mcts = env_flag("ST_MCTS") || SD_MCTS;
 
 // 阶段③：策略网络直接决策（不搜索）。
 //
